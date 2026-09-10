@@ -7,6 +7,7 @@
   "dependencies": {
     "@ant-yasa/uast-parser-java-js": "^0.2.16",
     "@ant-yasa/uast-parser-php": "^0.2.16",
+    "@ant-yasa/uast-parser-python": "file:../uast/parser-Python",
     "@ant-yasa/uast-spec": "^0.2.16",
     "@babel/core": "^7.14.6",
     "@babel/parser": "^7.16.4",
@@ -91,6 +92,7 @@
     "test-go": "npx mocha --require tsx/cjs test/go/test-go-benchmark.ts",
     "test-python": "npx mocha --require tsx/cjs test/python/test-python-benchmark.ts",
     "test-python-no-init-dispatch": "npx mocha --require tsx/cjs test/python/test-python-no-init-dispatch.ts",
+    "test-python-tree-sitter": "mocha --require tsx/cjs test/python/test-python-tree-sitter.ts",
     "test-fastapi-backgroundtasks": "npx mocha --require tsx/cjs test/python/test-fastapi-backgroundtasks-callback.ts test/python/test-fastapi-backgroundtasks-scanner.ts",
     "test-callchain": "npx mocha --require tsx/cjs test/callchain/test-callchain-benchmark.ts",
     "test-callargs": "npx mocha --require tsx/cjs test/callargs/test-callargs.ts",
@@ -197,8 +199,10 @@
       "dist/**/*",
       "resource/**/*",
       "deps/uast4go/uast4go",
-      "deps/uast4py/uast4py",
       "node_modules/tree-sitter-php/*.wasm",
+      "node_modules/tree-sitter-python/*.wasm",
+      "../uast/parser-Python/node_modules/tree-sitter-python/*.wasm",
+      "../uast/parser-Python/node_modules/web-tree-sitter/*.wasm",
       "node_modules/web-tree-sitter/web-tree-sitter.wasm"
     ],
     "targets": [

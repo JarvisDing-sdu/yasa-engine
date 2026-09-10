@@ -661,7 +661,7 @@ class BaseParser {
       language: 'python',
       unit: 'file',
       supportsIncremental: false,
-      parseAsFiles: false,
+      parseAsFiles: true,
       filePatterns: ['**/*.(py)', '!**/.venv/**', '!**/vendor/**', '!**/node_modules/**', '!**/site-packages/**'],
       parseSingleFile: (code, options) => {
         const PythonParser = require('./python/python-ast-builder')
