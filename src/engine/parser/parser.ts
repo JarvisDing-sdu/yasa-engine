@@ -1364,6 +1364,20 @@ class BaseParser {
 const parser = new BaseParser()
 
 /**
+ * Initialize parsers whose grammar is loaded asynchronously before any
+ * synchronous parseSingleFile call is made by an analyzer.
+ */
+async function ensureInitialized(language?: string): Promise<void> {
+  if (language === 'python') {
+    const PythonParser = require('./python/python-ast-builder')
+    await PythonParser.ensureInitialized()
+  } else if (language === 'php') {
+    const PhpParser = require('./php/php-ast-builder')
+    await PhpParser.ensureInitialized()
+  }
+}
+
+/**
  * 解析单个文件（用户操作接口）
  * @param filepath - 文件路径
  * @param options - 解析选项，必须包含 language
@@ -1415,6 +1429,7 @@ async function dumpAllAST(
 // ================== 导出接口 ====================
 
 module.exports = {
+  ensureInitialized,
   parseSingleFile,
   parseProject,
   dumpAllAST,

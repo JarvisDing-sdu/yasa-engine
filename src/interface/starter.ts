@@ -731,6 +731,12 @@ async function initAnalyzer(dir: any, args: any[] = [], printf?: any) {
     }
   }
 
+  // dump AST and other single-file paths call parseSingleFile synchronously.
+  // Initialize WASM-backed parsers before entering those paths.
+  if (Config.language) {
+    await Parser.ensureInitialized(Config.language)
+  }
+
   // dump AST
   if (Config.dumpAST) {
     if (!Config.single) {
@@ -855,6 +861,9 @@ async function initAnalyzer(dir: any, args: any[] = [], printf?: any) {
     Config.analyzer = f
     Analyzer = (analyzerEnum as any)[Config.analyzer]
   }
+  // Python and PHP load Tree-sitter WASM asynchronously, while analyzer
+  // internals use the synchronous parseSingleFile interface.
+  await Parser.ensureInitialized(Config.language)
   yasaLog(`Analysis language: ${Config.language}`, 'init')
   yasaLog(`Analysis analyzer: ${Config.analyzer}`, 'init')
   logScanInit(performanceTracker)

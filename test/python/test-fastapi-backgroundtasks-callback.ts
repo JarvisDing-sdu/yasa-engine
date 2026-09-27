@@ -1,7 +1,8 @@
 import * as assert from 'assert'
 import * as path from 'path'
-import { describe, it } from 'mocha'
-const { parseSingleFile: parseSingleFilePython } = require('../../src/engine/parser/python/python-ast-builder') as {
+import { before, describe, it } from 'mocha'
+const { ensureInitialized, parseSingleFile: parseSingleFilePython } = require('../../src/engine/parser/python/python-ast-builder') as {
+  ensureInitialized: () => Promise<void>
   parseSingleFile: (code: string, options: { uastSDKPath: string }) => unknown
 }
 import { dispatchPythonCallbackApiModel, type PythonFrameworkCallContext } from '../../src/engine/analyzer/python/framework-call-model'
@@ -96,8 +97,13 @@ function createContext(receiverDeclaration: Record<string, unknown>, aborted = f
 
 describe('FastAPI BackgroundTasks Python call path', function () {
   const fixture = path.join(__dirname, 'fastapi-backgroundtasks-cases/background_tasks.py')
-  const ast = parseSingleFilePython(require('fs').readFileSync(fixture, 'utf8'), { uastSDKPath: path.join(__dirname, '../../deps') })
-  attachParents(ast)
+  let ast: unknown
+
+  before(async function () {
+    await ensureInitialized()
+    ast = parseSingleFilePython(require('fs').readFileSync(fixture, 'utf8'), { uastSDKPath: path.join(__dirname, '../../deps') })
+    attachParents(ast)
+  })
 
   it('recognizes bound aliases and dispatches the callback once with rebased metadata', function () {
     const declaration = findDeclaration(ast, 'tasks')
