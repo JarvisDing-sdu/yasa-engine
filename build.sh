@@ -127,7 +127,9 @@ EOF
 info "步骤 7/8: 打包二进制 (npx pkg)"
 PKG_BUILD_LOG="$(pwd)/dist/pkg-build.log"
 set +e
-npx pkg . --options max-old-space-size=11264,expose-gc > /dev/null 2> "$PKG_BUILD_LOG"
+# Do not expose explicit GC in production: diagnostic hooks call global.gc()
+# after every entrypoint/stage, turning memory measurements into full-GC pauses.
+npx pkg . --options max-old-space-size=11264 > /dev/null 2> "$PKG_BUILD_LOG"
 PKG_EXIT_CODE=$?
 set -e
 if [ $PKG_EXIT_CODE -ne 0 ]; then
