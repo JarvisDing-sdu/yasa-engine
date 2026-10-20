@@ -201,8 +201,6 @@
       "deps/uast4go/uast4go",
       "node_modules/tree-sitter-php/*.wasm",
       "node_modules/tree-sitter-python/*.wasm",
-      "../uast/parser-Python/node_modules/tree-sitter-python/*.wasm",
-      "../uast/parser-Python/node_modules/web-tree-sitter/*.wasm",
       "node_modules/web-tree-sitter/web-tree-sitter.wasm"
     ],
     "targets": [

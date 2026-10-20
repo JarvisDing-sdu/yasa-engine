@@ -34,8 +34,21 @@ if ! rm -rf dist > /dev/null; then
 fi
 success "清理历史结果完成"
 
-# 步骤 1: 安装依赖
-info "步骤 1/8: 安装依赖 (npm install --ignore-scripts --package-lock=false)"
+# 步骤 1: 构建并安装依赖
+# Python parser 是 file:../uast/parser-Python 本地依赖。npm 会复用同版本的
+# node_modules 副本，因此先显式构建子模块，再清掉旧副本以避免打包过期 parser。
+PYTHON_PARSER_DIR="../uast/parser-Python"
+if [ ! -f "$PYTHON_PARSER_DIR/package.json" ]; then
+    alert "未找到 $PYTHON_PARSER_DIR；请先执行 git submodule update --init uast"
+fi
+info "步骤 1/8: 构建本地 Python UAST parser 并安装引擎依赖"
+if ! npm install --prefix "$PYTHON_PARSER_DIR" --ignore-scripts --package-lock=false > /dev/null; then
+    alert "Python UAST parser 依赖安装失败"
+fi
+if ! npm --prefix "$PYTHON_PARSER_DIR" run build > /dev/null; then
+    alert "Python UAST parser 构建失败"
+fi
+rm -rf node_modules/@ant-yasa/uast-parser-python
 if ! npm install --ignore-scripts --package-lock=false > /dev/null; then
     alert "npm install 失败"
 fi
@@ -59,10 +72,10 @@ fi
 success "uast-parser-php patch 完成"
 
 # 步骤 2: 类型检查
-info "步骤 2/8: 类型检查 (npx tsc --noEmit)"
+info "步骤 2/8: 类型检查 (TypeScript CLI --noEmit)"
 # 只重定向 stdout，保留 stderr 以便显示错误信息
 set +e
-npx tsc --noEmit > /dev/null
+node node_modules/typescript/bin/tsc --noEmit > /dev/null
 TSC_CHECK_EXIT_CODE=$?
 set -e
 if [ $TSC_CHECK_EXIT_CODE -ne 0 ]; then
@@ -103,10 +116,10 @@ EOF
 success "构建版本信息已生成 (build ${BUILD_DATE}, commit ${COMMIT_HASH})"
 
 # 步骤 6: 编译 TypeScript
-info "步骤 6/8: 编译 TypeScript (npx tsc)"
+info "步骤 6/8: 编译 TypeScript (TypeScript CLI)"
 # 只重定向 stdout，保留 stderr 以便显示错误信息
 set +e
-npx tsc > /dev/null
+node node_modules/typescript/bin/tsc > /dev/null
 TSC_EXIT_CODE=$?
 set -e
 if [ $TSC_EXIT_CODE -ne 0 ]; then
@@ -124,12 +137,12 @@ cat > dist/build-version.json <<EOF
 EOF
 
 # 步骤 7: 打包二进制
-info "步骤 7/8: 打包二进制 (npx pkg)"
+info "步骤 7/8: 打包二进制 (pkg CLI)"
 PKG_BUILD_LOG="$(pwd)/dist/pkg-build.log"
 set +e
 # Do not expose explicit GC in production: diagnostic hooks call global.gc()
 # after every entrypoint/stage, turning memory measurements into full-GC pauses.
-npx pkg . --options max-old-space-size=11264 > /dev/null 2> "$PKG_BUILD_LOG"
+node node_modules/pkg/lib-es5/bin.js . --options max-old-space-size=11264 > /dev/null 2> "$PKG_BUILD_LOG"
 PKG_EXIT_CODE=$?
 set -e
 if [ $PKG_EXIT_CODE -ne 0 ]; then
