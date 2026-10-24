@@ -52,6 +52,14 @@ rm -rf node_modules/@ant-yasa/uast-parser-python
 if ! npm install --ignore-scripts --package-lock=false > /dev/null; then
     alert "npm install 失败"
 fi
+
+# npm install 会重建 tree-sitter-python 的 .wasm；在此处注入与本仓库
+# grammar 修复严格对应的受控资产，确保后续测试和 pkg 打包使用同一个解析器。
+info "步骤 1.1/8: 注入 tree-sitter-python 星号 return 修复"
+if ! node scripts/apply-tree-sitter-python-wasm-patch.js; then
+    alert "tree-sitter-python WASM 修复注入失败"
+fi
+success "tree-sitter-python 星号 return 修复已注入"
 success "依赖安装完成"
 
 # 步骤 1.5: 下载并校验 SQLite native addon
