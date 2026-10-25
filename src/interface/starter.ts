@@ -318,13 +318,13 @@ async function initAnalyzer(dir: any, args: any[] = [], printf?: any) {
         setExitCode(ErrorCode.config_error)
       }
     })
-    .option('--language <lang>', '指定语言（支持: javascript/typescript/golang/python/java）', (lang: any) => {
-      const supported = ['javascript', 'typescript', 'js', 'ts', 'go', 'golang', 'python', 'java', 'php']
+    .option('--language <lang>', '指定语言（支持: javascript/typescript/golang/python/java/php/c）', (lang: any) => {
+      const supported = ['javascript', 'typescript', 'js', 'ts', 'go', 'golang', 'python', 'java', 'php', 'c']
       if (!supported.includes(lang)) {
         handleException(
           null,
-          'Unknown language!! Only support javascript/typescript/golang/python/java/php',
-          'Unknown language!! Only support javascript/typescript/golang/python/java/php'
+          'Unknown language!! Only support javascript/typescript/golang/python/java/php/c',
+          'Unknown language!! Only support javascript/typescript/golang/python/java/php/c'
         )
         initError = true
         setExitCode(ErrorCode.config_error)
@@ -798,6 +798,8 @@ async function initAnalyzer(dir: any, args: any[] = [], printf?: any) {
 
   const PhpAnalyzer = require('../engine/analyzer/php/common/php-analyzer')
 
+  const CAnalyzer = require('../engine/analyzer/c/common/c-analyzer')
+
   const analyzerEnum = {
     EggAnalyzer,
     JavaScriptAnalyzer,
@@ -806,6 +808,7 @@ async function initAnalyzer(dir: any, args: any[] = [], printf?: any) {
     SpringAnalyzer,
     PythonAnalyzer,
     PhpAnalyzer,
+    CAnalyzer,
   }
   const analyzerLanguage = {
     EggAnalyzer: 'javascript',
@@ -815,6 +818,7 @@ async function initAnalyzer(dir: any, args: any[] = [], printf?: any) {
     GoAnalyzer: 'golang',
     PythonAnalyzer: 'python',
     PhpAnalyzer: 'php',
+    CAnalyzer: 'c',
   }
 
   let Analyzer: any
@@ -824,8 +828,8 @@ async function initAnalyzer(dir: any, args: any[] = [], printf?: any) {
     if (!Analyzer || Analyzer === '') {
       handleException(
         null,
-        'analyzer set failed,now YASA supported EggAnalyzer|JavaScriptAnalyzer|JavaAnalyzer|SpringAnalyzer|GoAnalyzer|PythonAnalyzer|PhpAnalyzer',
-        'analyzer set failed,now YASA supported EggAnalyzer|JavaScriptAnalyzer|JavaAnalyzer|SpringAnalyzer|GoAnalyzer|PythonAnalyzer|PhpAnalyzer'
+        'analyzer set failed,now YASA supported EggAnalyzer|JavaScriptAnalyzer|JavaAnalyzer|SpringAnalyzer|GoAnalyzer|PythonAnalyzer|PhpAnalyzer|CAnalyzer',
+        'analyzer set failed,now YASA supported EggAnalyzer|JavaScriptAnalyzer|JavaAnalyzer|SpringAnalyzer|GoAnalyzer|PythonAnalyzer|PhpAnalyzer|CAnalyzer'
       )
       return
     }
@@ -853,6 +857,9 @@ async function initAnalyzer(dir: any, args: any[] = [], printf?: any) {
         case 'php':
           f = 'PhpAnalyzer'
           break
+        case 'c':
+          f = 'CAnalyzer'
+          break
         default:
           handleException(null, 'default analyzer set failed', 'default analyzer set failed')
           return
@@ -861,7 +868,7 @@ async function initAnalyzer(dir: any, args: any[] = [], printf?: any) {
     Config.analyzer = f
     Analyzer = (analyzerEnum as any)[Config.analyzer]
   }
-  // Python and PHP load Tree-sitter WASM asynchronously, while analyzer
+  // Python, PHP and C load Tree-sitter WASM asynchronously, while analyzer
   // internals use the synchronous parseSingleFile interface.
   await Parser.ensureInitialized(Config.language)
   yasaLog(`Analysis language: ${Config.language}`, 'init')
@@ -953,6 +960,9 @@ function loadSource(absdirs: any) {
       break
     case 'php':
       fext = ['php']
+      break
+    case 'c':
+      fext = ['c', 'h']
       break
     default:
       // Keep default .sol extension for unknown languages
@@ -1123,6 +1133,9 @@ function detectFileLanguage(filename: any) {
       return 'python'
     case 'php':
       return 'php'
+    case 'c':
+    case 'h':
+      return 'c'
     default:
       return null
   }

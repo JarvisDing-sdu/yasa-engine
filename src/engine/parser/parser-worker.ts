@@ -58,6 +58,15 @@ async function ensurePhpParserReady(): Promise<void> {
   phpInitialized = true
 }
 
+// C parser 同样需要异步初始化 tree-sitter WASM
+let cInitialized = false
+async function ensureCParserReady(): Promise<void> {
+  if (cInitialized) return
+  const CParser = require('./c/c-ast-builder')
+  await CParser.ensureInitialized()
+  cInitialized = true
+}
+
 async function processParseTask(task: ParseTask): Promise<{ filepath: string; ast: any; error?: string }> {
   if (task.config.maindirPrefix !== undefined) {
     config.maindirPrefix = task.config.maindirPrefix
@@ -66,6 +75,9 @@ async function processParseTask(task: ParseTask): Promise<{ filepath: string; as
     // PHP 需要先异步初始化 tree-sitter WASM
     if (task.language === 'php') {
       await ensurePhpParserReady()
+    }
+    if (task.language === 'c') {
+      await ensureCParserReady()
     }
     if (task.language === 'python') {
       const PythonParser = require('./python/python-ast-builder')

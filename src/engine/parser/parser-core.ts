@@ -34,6 +34,7 @@ const parsers: Record<string, ((code: string, options: Record<string, any>) => a
   python: null,
   golang: null,
   php: null,
+  c: null,
 }
 
 /**
@@ -87,6 +88,12 @@ function getParser(language: string): ((code: string, options: Record<string, an
       const PhpParser = require('./php/php-ast-builder')
       parser = (c: string, opts: Record<string, any>) => PhpParser.parseSingleFile(c, opts)
       parsers.php = parser
+      break
+    }
+    case 'c': {
+      const CParser = require('./c/c-ast-builder')
+      parser = (c: string, opts: Record<string, any>) => CParser.parseSingleFile(c, opts)
+      parsers.c = parser
       break
     }
     default:

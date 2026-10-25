@@ -185,6 +185,12 @@
     "demoRuleConfigPath": "resource/example-rule-config/rule_config_php.json"
   },
   {
+    "checkerId": "taint_flow_c_input",
+    "checkerPath": "checker/taint/c/c-default-taint-checker.ts",
+    "description": "C污点分析checker，以调用图根函数（含main）为entrypoint，main的argv/envp与ruleconfig库函数为source",
+    "demoRuleConfigPath": "resource/example-rule-config/rule_config_c.json"
+  },
+  {
     "checkerId": "taint_flow_test",
     "checkerPath": "checker/taint/test-taint-checker.ts",
     "description": "taint_flow_test，回归测试使用，不推荐外部使用",

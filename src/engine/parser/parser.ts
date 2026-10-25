@@ -713,6 +713,25 @@ class BaseParser {
       },
       needsSourcefile: true,
     })
+
+    // 注册 C 解析器（tree-sitter-c，头文件与源文件一起解析）
+    this.registry.register({
+      language: 'c',
+      unit: 'file',
+      supportsIncremental: false,
+      parseAsFiles: true,
+      filePatterns: ['**/*.c', '**/*.h'],
+      parseSingleFile: (code, options) => {
+        const CParser = require('./c/c-ast-builder')
+        return CParser.parseSingleFile(code, options)
+      },
+      parseProject: async () => {
+        const CParser = require('./c/c-ast-builder')
+        await CParser.ensureInitialized()
+        return null
+      },
+      needsSourcefile: true,
+    })
   }
 
   /**
@@ -1374,6 +1393,9 @@ async function ensureInitialized(language?: string): Promise<void> {
   } else if (language === 'php') {
     const PhpParser = require('./php/php-ast-builder')
     await PhpParser.ensureInitialized()
+  } else if (language === 'c') {
+    const CParser = require('./c/c-ast-builder')
+    await CParser.ensureInitialized()
   }
 }
 
