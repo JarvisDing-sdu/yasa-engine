@@ -338,6 +338,43 @@ async function initAnalyzer(dir: any, args: any[] = [], printf?: any) {
       }
       Config.language = lang
     })
+    .option('--cDefine <macros>', 'C 预处理宏定义，逗号分隔，等同 -D（如 FEATURE,LEVEL=2）', (list: any) => {
+      for (const item of String(list).split(',').filter(Boolean)) {
+        const eq = item.indexOf('=')
+        const name = eq >= 0 ? item.slice(0, eq) : item
+        Config.cPreprocessor!.defines[name] = eq >= 0 ? item.slice(eq + 1) : '1'
+      }
+    })
+    .option('--cUndefine <macros>', 'C 预处理取消定义的宏，逗号分隔，等同 -U', (list: any) => {
+      Config.cPreprocessor!.undefines.push(...String(list).split(',').filter(Boolean))
+    })
+    .option('--cTarget <platform>', 'C 目标平台预定义宏：linux（默认）/macos/windows/none', (target: any) => {
+      if (!['linux', 'macos', 'windows', 'none'].includes(target)) {
+        handleException(null, `未知的 C 目标平台: ${target}`, `Unknown C target: ${target}`)
+        initError = true
+        setExitCode(ErrorCode.config_error)
+        return
+      }
+      Config.cPreprocessor!.target = target
+    })
+    .option(
+      '--cUnknownMacros <mode>',
+      'C 中配置与代码都未决定的宏：cover（默认，条件两侧都分析）/undefined（按 C 标准视为未定义，只分析一种配置）',
+      (mode: any) => {
+        if (!['cover', 'undefined'].includes(mode)) {
+          handleException(null, `未知的 --cUnknownMacros: ${mode}`, `Unknown --cUnknownMacros: ${mode}`)
+          initError = true
+          setExitCode(ErrorCode.config_error)
+          return
+        }
+        Config.cPreprocessor!.unknownMacros = mode
+      }
+    )
+    .option('--cIncludeDir <dirs>', 'C 头文件搜索目录，逗号分隔，等同 -I', (list: any) => {
+      for (const dir of String(list).split(',').filter(Boolean)) {
+        Config.cPreprocessor!.includeDirs.push(path.isAbsolute(dir) ? dir : path.resolve(process.cwd(), dir))
+      }
+    })
     .option('--analyzer <analyzer>', '指定框架', (f: any) => {
       Config.analyzer = f
     })

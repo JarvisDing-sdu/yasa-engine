@@ -16,10 +16,13 @@ const { executeViaEntryPointExecutor } =
   require('../../common/entrypoint/entrypoint-executor') as typeof import('../../common/entrypoint/entrypoint-executor')
 const { handleException } = require('../../common/exception-handler')
 const { applyCLibraryModel } = require('./builtins/c-builtins')
+const StateUtil = require('../../../util/state-util')
+const { foldConstant } = require('./c-const-eval')
+const { CTypeIndex } = require('./c-types')
 
 const {
   valueUtil: {
-    ValueUtil: { Scoped, ObjectValue, UndefinedValue, PrimitiveValue },
+    ValueUtil: { Scoped, ObjectValue, UndefinedValue, PrimitiveValue, UnionValue },
   },
 } = require('../../common')
 
@@ -55,17 +58,97 @@ function isAggregateType(varType: any): boolean {
   return false
 }
 
-/** 之后到下一个标签之前的同级语句不可达 */
-const TERMINATORS = new Set(['ReturnStatement', 'BreakStatement', 'ContinueStatement'])
+/**
+ * @param node - 表达式
+ * @returns 去掉类型转换后的表达式
+ */
+function stripCasts(node: any): any {
+  let current = node
+  while (current?.type === 'CastExpression') current = current.expression
+  return current
+}
 
 /**
- * 循环体在顶层以无条件 break/return 结束（Juliet 与很多 C 代码的 `while (1) { ...; break; }`）
- * @param body - 循环体
- * @returns 是否只执行一次
+ * @param node - 表达式
+ * @returns 是否为可写的存储位置（变量、字段、下标）
  */
-function endsUnconditionally(body: any): boolean {
-  const statements: any[] = body?.type === 'ScopedStatement' ? body.body || [] : body ? [body] : []
-  return statements.some((s) => s?.type === 'BreakStatement' || s?.type === 'ReturnStatement')
+function isLocation(node: any): boolean {
+  return node?.type === 'Identifier' || node?.type === 'MemberAccess'
+}
+
+/**
+ * @param value - 函数值或函数值的并集
+ * @returns 其中的函数定义
+ */
+function definitionsOf(value: any): any[] {
+  if (!value || typeof value !== 'object') return []
+  if (value.vtype === 'union' && Array.isArray(value.value)) return value.value.filter((v: any) => v?.vtype === 'fclos')
+  return value.vtype === 'fclos' ? [value] : []
+}
+
+/**
+ * @param fclos - 函数值
+ * @returns 是否定义在配置未决定的 #if 分支中
+ */
+function isConditional(fclos: any): boolean {
+  return !!fclos?.ast?.fdef?._meta?.conditional
+}
+
+/**
+ * @param fclos - 函数值
+ * @returns 是否定义在头文件中
+ */
+function isHeaderDefinition(fclos: any): boolean {
+  return String(fclos?.ast?.fdef?.loc?.sourcefile ?? '').endsWith('.h')
+}
+
+/** 不可达代码中仍需处理的定义（函数、struct） */
+const HOISTED = new Set(['FunctionDefinition', 'ClassDefinition'])
+
+/** 突然完成（abrupt completion）的种类 */
+type Abrupt = 'return' | 'break' | 'continue' | 'goto'
+
+/**
+ * 当前执行路径的控制流状态。`dead` 表示当前路径已经因 return/break/continue/goto
+ * 离开顺序执行；`pending` 是已执行到的 goto 的目标标签，执行到这些标签时路径恢复。
+ */
+interface ControlFlow {
+  dead: boolean
+  reasons: Set<Abrupt>
+  pending: Set<string>
+  /** 标签 → 各条 goto 跳转时的变量快照，在标签处与顺序到达的路径合并 */
+  labelStates: Map<string, ScopeSnapshot[]>
+}
+
+/** 从当前块到函数作用域各层 scope 的变量值 */
+type ScopeSnapshot = Array<{ scope: any; fields: Map<string, any> }>
+
+/** 分支（if 的两臂、switch 的 case）执行结束时的控制流状态 */
+interface BranchResult {
+  dead: boolean
+  reasons: Set<Abrupt>
+  /** 进入分支时的变量快照（单分支 if 需要丢弃 return 分支的写入时记录） */
+  before?: ScopeSnapshot
+}
+
+/**
+ * @returns 顺序执行中的控制流状态
+ */
+function liveFlow(): ControlFlow {
+  return { dead: false, reasons: new Set(), pending: new Set(), labelStates: new Map() }
+}
+
+/**
+ * 语句（块）中是否含有给定集合中的标签：跳转目标可能在嵌套块里
+ * @param node - 语句
+ * @param labels - 标签名
+ * @returns 是否包含
+ */
+function containsLabel(node: any, labels: Set<string>): boolean {
+  if (!node || labels.size === 0) return false
+  if (node.type === 'LabeledStatement') return labels.has(node.label?.name) || containsLabel(node.body, labels)
+  if (node.type === 'ScopedStatement') return (node.body || []).some((s: any) => containsLabel(s, labels))
+  return false
 }
 
 /**
@@ -86,10 +169,19 @@ class CAnalyzer extends Analyzer {
   private timedOutEntryPoints = 0
 
   /**
-   * `&x` 产生的值 → x 的位置。引擎中指针与被指对象共享同一个值，
-   * 通过该表把 `*p = v` 写回到 p 指向的变量。
+   * 地址值 → 它指向的存储位置（scope + Identifier/MemberAccess）。`*e = v` 与 `*e`
+   * 通过 e 当前值查表，逐级定位多级指针指向的位置。
    */
   private pointees = new WeakMap<object, { scope: any; node: any }>()
+
+  /** `&x` 为标量/指针变量创建的地址值 */
+  private addresses = new WeakSet<object>()
+
+  /** 声明类型索引 */
+  private types = new CTypeIndex()
+
+  /** 当前函数体的控制流状态；每次函数调用独立 */
+  private flow: ControlFlow = liveFlow()
 
   /**
    * @param options - 分析选项
@@ -193,7 +285,9 @@ class CAnalyzer extends Analyzer {
     let m = this.topScope.context.modules.members.get(filename)
     if (m && typeof m === 'object') return m
 
+    this.types.annotate(ast)
     const modClos = this.initModuleScope(ast, filename)
+    this.importHeaderStatics(ast, modClos)
     this.topScope.context.modules.members.set(filename, modClos.getFieldValue('module.exports'))
     m = this.processModuleDirect(ast, filename, modClos)
     this.moduleScopes.set(filename, modClos)
@@ -262,26 +356,71 @@ class CAnalyzer extends Analyzer {
   }
 
   /**
-   * 非 static 的文件级函数具有外部链接，注册到 topScope 供其它文件调用。
+   * 文件级函数的链接：
+   * - 非 static 函数具有外部链接，注册到 topScope 供其它文件调用；
+   * - 头文件中的 static（inline）函数属于包含它的每个编译单元，由 importHeaderStatics 放入
+   *   各 .c 的模块 scope；topScope 中只保留一份，供无法解析 #include 的编译单元回退使用；
+   * - 同名函数在配置未决定的 #if 分支中各有一份定义时（`_meta.conditional`），
+   *   调用处可能调用其中任意一个：保存为各定义的并集，而不是取第一个。
    * @param scope - 当前 scope
    * @param node - FunctionDefinition
    * @param state - 状态
    * @returns 函数值
    */
   override processFunctionDefinition(scope: any, node: any, state: any): any {
-    const fclos = super.processFunctionDefinition(scope, node, state)
     const name = node?.id?.name
+    const previous = scope?.isCModule && name && node.body ? scope.getMemberValue?.(name) : undefined
+    const fclos = super.processFunctionDefinition(scope, node, state)
+    if (!scope?.isCModule || !name || !node.body || !fclos) return fclos
     const isStatic = (node.modifiers || []).includes('static')
-    // 头文件里的 static inline 函数会被 #include 到每个使用它的文件中，同样全局可见
     const inHeader = String(node.loc?.sourcefile ?? '').endsWith('.h')
-    if (scope?.isCModule && name && node.body && fclos && (!isStatic || inHeader)) {
-      const existing = this.topScope.value[name]
-      // Keep the first non-header definition when the same symbol is defined twice (e.g. #if branches).
-      if (!existing || !existing.ast?.fdef || String(existing.ast.fdef.loc?.sourcefile ?? '').endsWith('.h')) {
-        this.topScope.value[name] = fclos
-      }
+    let value = fclos
+    if (previous && previous !== fclos && (node._meta?.conditional || definitionsOf(previous).some(isConditional))) {
+      value = this.unionDefinitions(scope, name, [previous, fclos])
+      scope.setMemberValue(name, value)
+    }
+    if (isStatic && !inHeader) return fclos
+    const existing = this.topScope.value[name]
+    if (!existing) {
+      this.topScope.value[name] = value
+    } else if (value !== fclos || (node._meta?.conditional && definitionsOf(existing).some(isConditional))) {
+      this.topScope.value[name] = this.unionDefinitions(this.topScope, name, [existing, value])
+    } else if (definitionsOf(existing).every((f: any) => isHeaderDefinition(f)) && !inHeader) {
+      // .c 中的定义优先于头文件中的同名定义
+      this.topScope.value[name] = value
     }
     return fclos
+  }
+
+  /**
+   * @param scope - scope
+   * @param name - 函数名
+   * @param values - 函数值（可含已有的并集）
+   * @returns 各定义的并集
+   */
+  private unionDefinitions(scope: any, name: string, values: any[]): any {
+    const union = new UnionValue(undefined, undefined, `${scope.qid}.<union@def:${name}>`, undefined)
+    for (const f of [...new Set(values.flatMap(definitionsOf))]) union.appendValue(f)
+    return union
+  }
+
+  /**
+   * 编译单元包含（直接或间接）的头文件中的 static 函数在该编译单元内可见。
+   * @param ast - .c 文件的 CompileUnit
+   * @param modClos - 模块 scope
+   */
+  private importHeaderStatics(ast: any, modClos: any): void {
+    for (const header of ast?._meta?.includes || []) {
+      const headerScope = this.moduleScopes.get(header)
+      if (!headerScope) continue
+      for (const key of Object.keys(headerScope._field || {})) {
+        const value = headerScope.getMemberValue(key)
+        const defs = definitionsOf(value)
+        if (defs.length && defs.every((f: any) => (f.ast?.fdef?.modifiers || []).includes('static'))) {
+          modClos.setMemberValue(key, value)
+        }
+      }
+    }
   }
 
   /**
@@ -298,10 +437,78 @@ class CAnalyzer extends Analyzer {
     }
     const result = super.processCallExpression(scope, node, state)
     if (callee?.type === 'Identifier' && NUMERIC_CONVERSIONS.has(callee.name)) {
-      // 数值转换是注入类 sink 的屏障：整数无法携带命令/路径/SQL/格式串注入
-      return new PrimitiveValue(scope.qid, `<${callee.name}>`, null, 'number', 'Literal', node.loc)
+      // 整数无法携带命令/路径/SQL/格式串注入，但仍由输入决定：保留为数值污点，供长度类 sink 使用
+      if (!result?.taint?.isTaintedRec || typeof result !== 'object') {
+        return new PrimitiveValue(scope.qid, `<${callee.name}>`, null, 'number', 'Literal', node.loc)
+      }
+      this.markNumeric(result)
+      return result
     }
     return result
+  }
+
+  /**
+   * @param value - 值
+   * @returns 是否只携带数值污点（atoi 等转换的结果及其算术运算）
+   */
+  isNumericTaint(value: any): boolean {
+    return !!value && typeof value === 'object' && value.cNumericTaint === true
+  }
+
+  /**
+   * @param value - 标记为数值污点的值
+   */
+  markNumeric(value: any): void {
+    if (value && typeof value === 'object') value.cNumericTaint = true
+  }
+
+  /**
+   * 算术结果：所有带污点的操作数都是数值污点时，结果仍是数值污点
+   * @param result - 运算结果
+   * @param operands - 操作数
+   * @returns result
+   */
+  private propagateNumeric(result: any, operands: any[]): any {
+    const tainted = operands.filter((v) => v?.taint?.isTaintedRec)
+    if (tainted.length > 0 && tainted.every((v) => this.isNumericTaint(v))) this.markNumeric(result)
+    return result
+  }
+
+  /**
+   * @param node - 表达式
+   * @returns 声明类型
+   */
+  cTypeOf(node: any): any {
+    return this.types.typeOf(node)
+  }
+
+  /**
+   * @param scope - scope
+   * @param sid - 名称
+   * @param node - 产生该值的节点
+   * @returns 不带污点的新值
+   */
+  newCValue(scope: any, sid: string, node: any): any {
+    return new ObjectValue(scope.qid, { sid, parent: scope, ast: node })
+  }
+
+  /**
+   * 库函数写入输出参数：`*p` 形式的目标按指针模型写入被指向的位置
+   * @param scope - scope
+   * @param target - 位置（Identifier / MemberAccess / DereferenceExpression）
+   * @param value - 值
+   * @param state - 状态
+   */
+  writeCLocation(scope: any, target: any, value: any, state: any): void {
+    if (target?.type === 'DereferenceExpression') {
+      const pointerNode = stripCasts(target.argument)
+      const pointerValue = this.processInstruction(scope, pointerNode, state)
+      const pointee = pointerValue && typeof pointerValue === 'object' ? this.pointees.get(pointerValue) : undefined
+      if (pointee) this.saveVarInScope(pointee.scope, pointee.node, value, state)
+      else if (isLocation(pointerNode)) this.saveVarInScope(scope, pointerNode, value, state)
+      return
+    }
+    this.saveVarInScope(scope, target, value, state)
   }
 
   /**
@@ -327,7 +534,61 @@ class CAnalyzer extends Analyzer {
       const init = { type: 'ObjectExpression', properties: [], loc: node.loc, _meta: { aggregate: true } }
       return super.processVariableDeclaration(target, { ...node, init }, state)
     }
-    return super.processVariableDeclaration(target, node, state)
+    const value = super.processVariableDeclaration(target, node, state)
+    // `struct S b = a;`：b 是 a 的副本，而不是同一个对象
+    if (node.init && node.init.type !== 'ObjectExpression' && this.types.isStruct(node.varType)) {
+      const copy = this.copyAggregate(value, node.varType, target)
+      if (copy !== value) this.saveVarInCurrentScope(target, node.id, copy, state)
+      return copy
+    }
+    return value
+  }
+
+  /**
+   * struct 按值复制：每个字段是独立的存储，嵌套 struct 与数组成员递归复制，
+   * 指针成员只复制指针值（仍指向同一被指对象）。
+   * @param value - 源对象
+   * @param type - 声明类型
+   * @param scope - 新对象所在 scope
+   * @param depth - 递归深度
+   * @returns 副本；不是对象值时原样返回
+   */
+  private copyAggregate(value: any, type: any, scope: any, depth = 0): any {
+    if (!value || typeof value !== 'object' || value.vtype !== 'object' || depth > 16 || this.addresses.has(value)) {
+      return value
+    }
+    const fieldTypes = this.types.fieldsOf(type)
+    const elementType = this.types.isArray(type) ? this.types.elementOf(type) : undefined
+    const copy = new ObjectValue(scope.qid, { sid: value.sid, parent: scope })
+    if (value.taint?.isTainted) copy.taint?.copyFrom(value.taint)
+    const keys = new Set<string>([
+      ...Object.keys(value._field || {}),
+      ...(value.members ? [...value.members.keys()] : []),
+    ])
+    for (const key of keys) {
+      const member = value.getMemberValue(key)
+      const memberType = fieldTypes ? fieldTypes.get(key) : elementType
+      const byValue = memberType && (this.types.isStruct(memberType) || this.types.isArray(memberType))
+      copy.setMemberValue(key, byValue ? this.copyAggregate(member, memberType, scope, depth + 1) : member)
+    }
+    return copy
+  }
+
+  /**
+   * 按值传递的 struct 形参是实参的副本：被调函数修改形参不影响调用方。
+   * @param fscope - 被调函数 scope
+   * @param params - 形参
+   * @param state - 状态
+   * @param node - 调用节点
+   */
+  protected override onParamsBound(fscope: any, params: any[], state: any, node: any): void {
+    super.onParamsBound(fscope, params, state, node)
+    for (const param of params || []) {
+      if (!param?.id || !this.types.isStruct(param.varType)) continue
+      const value = this._getMemberValueDirect(fscope, param.id, state, false, 0, new Set())
+      const copy = this.copyAggregate(value, param.varType, fscope)
+      if (copy !== value) this.saveVarInCurrentScope(fscope, param.id, copy, state)
+    }
   }
 
   /**
@@ -344,11 +605,20 @@ class CAnalyzer extends Analyzer {
     if (node?.left?.type === 'MemberAccess' && node.left.object?.type === 'MemberAccess') {
       this.materializeMember(scope, node.left.object, state)
     }
-    return super.processAssignmentExpression(scope, node, state)
+    const value = super.processAssignmentExpression(scope, node, state)
+    // `b = a;`（struct 类型）：复制而不是让 b 与 a 共享对象
+    const leftType = node?.operator === '=' ? this.types.typeOf(node.left) : undefined
+    if (leftType && this.types.isStruct(leftType) && isLocation(node.left)) {
+      const copy = this.copyAggregate(value, leftType, scope)
+      if (copy !== value) this.saveVarInScope(scope, node.left, copy, state)
+      return copy
+    }
+    return value
   }
 
   /**
-   * `*p = v`：写回 p 所指向的变量，并让 p 继续指向新值。
+   * `*p = v`：写入 p 所指向的存储位置。位置由 `&x` 产生的地址值确定，
+   * 多级解引用（`**r = v`）逐级读取中间指针的当前值。
    * @param scope - 当前 scope
    * @param node - AssignmentExpression，left 为 DereferenceExpression
    * @param state - 状态
@@ -359,32 +629,56 @@ class CAnalyzer extends Analyzer {
     if (!value || typeof value !== 'object') {
       value = new PrimitiveValue(scope.qid, `<literal_${value}>`, value, null, 'Literal', node.right?.loc)
     }
-    let pointerNode = node.left.argument
-    while (pointerNode?.type === 'CastExpression') pointerNode = pointerNode.expression
+    const pointerNode = stripCasts(node.left.argument)
     const pointerValue = this.processInstruction(scope, pointerNode, state)
     const pointee = pointerValue && typeof pointerValue === 'object' ? this.pointees.get(pointerValue) : undefined
     value = SourceLine.addSrcLineInfo(value, node, node.loc?.sourcefile, 'Var Pass:', AstUtil.prettyPrintAST(node.left))
+    const leftType = this.types.typeOf(node.left)
+    if (
+      leftType &&
+      this.types.isStruct(leftType) &&
+      !this.addresses.has(pointerValue) &&
+      pointerValue?.vtype === 'object'
+    ) {
+      // `*ps = b`：struct 的存储就是被指对象，逐字段覆盖其内容
+      const copy = this.copyAggregate(value, leftType, scope)
+      if (copy !== pointerValue && copy?.vtype === 'object') {
+        const keys = new Set<string>([
+          ...Object.keys(copy._field || {}),
+          ...(copy.members ? [...copy.members.keys()] : []),
+        ])
+        for (const key of keys) pointerValue.setMemberValue(key, copy.getMemberValue(key))
+        return pointerValue
+      }
+    }
     if (pointee) {
       this.saveVarInScope(pointee.scope, pointee.node, value, state)
-      this.pointees.set(value, pointee)
-    }
-    if (pointerNode?.type === 'Identifier' || pointerNode?.type === 'MemberAccess') {
+    } else if (!this.addresses.has(pointerValue) && isLocation(pointerNode)) {
+      // 指向未知存储（参数、堆）：引擎中指针与被指内容是同一个值，写入指针变量本身
       this.saveVarInScope(scope, pointerNode, value, state)
     }
     return value
   }
 
   /**
-   * `&x`：记录被指向的位置，供后续 `*p = v` 写回。
+   * `&x`：标量/指针变量的地址是独立于 x 当前值的地址值，记录它指向的位置；
+   * struct/数组（以及类型未知时）的存储就是其对象本身，沿用对象引用。
    * @param scope - 当前 scope
    * @param node - ReferenceExpression
    * @param state - 状态
-   * @returns x 的值
+   * @returns 地址值
    */
   override processReferenceExpression(scope: any, node: any, state: any): any {
+    const target = stripCasts(node?.argument)
+    const targetType = this.types.typeOf(target)
+    if (isLocation(target) && targetType && !this.types.isStruct(targetType) && !this.types.isArray(targetType)) {
+      const address = new ObjectValue(scope.qid, { sid: `&${AstUtil.prettyPrintAST(target)}`, parent: scope })
+      this.pointees.set(address, { scope, node: target })
+      this.addresses.add(address)
+      return address
+    }
     const value = super.processReferenceExpression(scope, node, state)
-    const target = node?.argument
-    if (value && typeof value === 'object' && (target?.type === 'Identifier' || target?.type === 'MemberAccess')) {
+    if (value && typeof value === 'object' && isLocation(target)) {
       this.pointees.set(value, { scope, node: target })
     }
     return value
@@ -404,69 +698,365 @@ class CAnalyzer extends Analyzer {
   }
 
   /**
-   * 块内 return / goto 之后到下一个标签之前的语句不可达，执行前剪掉。
+   * 当前路径不可达（return/break/continue/goto 之后）时跳过语句，直到 goto 的目标标签。
    * @param scope - 当前 scope
-   * @param node - ScopedStatement
+   * @param node - 指令
    * @param state - 状态
-   * @returns 块结果
+   * @param prePostFlag - 前/后处理标记
+   * @returns 指令结果
    */
-  override processScopedStatement(scope: any, node: any, state: any): any {
-    const body: any[] = node?.body || []
-    const reachable: any[] = []
-    let dead = false
-    for (const stmt of body) {
-      if (stmt?.type === 'LabeledStatement') dead = false
-      if (!dead) reachable.push(stmt)
-      if (TERMINATORS.has(stmt?.type) || (stmt?.type === 'Noop' && stmt._meta?.goto)) dead = true
+  override processInstruction(scope: any, node: any, state: any, prePostFlag?: any): any {
+    const { flow } = this
+    if (
+      flow.dead &&
+      node &&
+      typeof node === 'object' &&
+      !node.vtype &&
+      !Array.isArray(node) &&
+      !HOISTED.has(node.type) &&
+      !containsLabel(node, flow.pending)
+    ) {
+      return new UndefinedValue()
     }
-    if (reachable.length === body.length) return super.processScopedStatement(scope, node, state)
-    return super.processScopedStatement(scope, { ...node, body: reachable }, state)
+    return super.processInstruction(scope, node, state, prePostFlag)
   }
 
   /**
-   * 常量条件（`if (0)`、`if (1)`）只执行可达分支。
+   * 当前路径以 return/break/continue/goto 结束
+   * @param kind - 种类
+   * @param label - goto 目标
+   */
+  private abrupt(kind: Abrupt, label?: string): void {
+    this.flow.dead = true
+    this.flow.reasons = new Set([kind])
+    if (label) this.flow.pending.add(label)
+  }
+
+  /**
+   * @param scope - 当前 scope
+   * @param node - ReturnStatement
+   * @param state - 状态
+   * @returns 返回值
+   */
+  override processReturnStatement(scope: any, node: any, state: any): any {
+    const ret = super.processReturnStatement(scope, node, state)
+    this.abrupt('return')
+    return ret
+  }
+
+  /**
+   * @param scope - 当前 scope
+   * @param node - BreakStatement
+   * @param state - 状态
+   * @returns UndefinedValue
+   */
+  override processBreakStatement(scope: any, node: any, state: any): any {
+    this.abrupt('break')
+    return super.processBreakStatement(scope, node, state)
+  }
+
+  /**
+   * @param scope - 当前 scope
+   * @param node - ContinueStatement
+   * @param state - 状态
+   * @returns UndefinedValue
+   */
+  override processContinueStatement(scope: any, node: any, state: any): any {
+    this.abrupt('continue')
+    return super.processContinueStatement(scope, node, state)
+  }
+
+  /**
+   * parser 把 `goto L` 表示为带 `_meta.goto` 的 Noop：跳过后续语句直到标签 L
+   * @param scope - 当前 scope
+   * @param node - Noop
+   * @param state - 状态
+   * @returns 结果
+   */
+  override processNoop(scope: any, node: any, state: any): any {
+    const label = node?._meta?.goto
+    if (label) {
+      const states = this.flow.labelStates.get(label) ?? []
+      states.push(this.snapshotScopes(scope))
+      this.flow.labelStates.set(label, states)
+      this.abrupt('goto', label)
+    }
+    return super.processNoop(scope, node, state)
+  }
+
+  /**
+   * 记录当前函数内各层 scope 的变量值（goto 跳转时的状态）
+   * @param scope - 当前 scope
+   * @returns 快照
+   */
+  private snapshotScopes(scope: any): ScopeSnapshot {
+    const snapshot: ScopeSnapshot = []
+    for (let s = scope, depth = 0; s && !s.isCModule && s !== this.topScope && depth < 64; s = s.parent, depth++) {
+      const keys = new Set<string>([...Object.keys(s._field || {}), ...(s.members ? [...s.members.keys()] : [])])
+      const fields = new Map<string, any>()
+      for (const key of keys) fields.set(key, s.getMemberValue(key))
+      snapshot.push({ scope: s, fields })
+    }
+    return snapshot
+  }
+
+  /**
+   * 把快照中的变量恢复为快照时的值
+   * @param snapshot - 快照
+   */
+  private restoreScopes(snapshot: ScopeSnapshot): void {
+    for (const { scope, fields } of snapshot) {
+      for (const [key, value] of fields) {
+        if (value && scope.getMemberValue(key) !== value) scope.setMemberValue(key, value)
+      }
+    }
+  }
+
+  /**
+   * 在标签处合并 goto 跳转来的状态：路径不可达时（只能经 goto 到达）取各次跳转状态的并，
+   * 顺序可达时再与当前值合并。
+   * @param label - 标签
+   * @param resuming - 是否仅能经 goto 到达
+   */
+  private joinLabelStates(label: string, resuming: boolean): void {
+    const snapshots = this.flow.labelStates.get(label)
+    if (!snapshots) return
+    this.flow.labelStates.delete(label)
+    const byScope = new Map<any, Map<string, any[]>>()
+    for (const snapshot of snapshots) {
+      for (const { scope, fields } of snapshot) {
+        const merged = byScope.get(scope) ?? new Map<string, any[]>()
+        for (const [key, value] of fields) merged.set(key, [...(merged.get(key) ?? []), value])
+        byScope.set(scope, merged)
+      }
+    }
+    for (const [scope, fields] of byScope) {
+      for (const [key, values] of fields) {
+        const candidates = resuming ? values : [scope.getMemberValue(key), ...values]
+        const distinct = [...new Set(candidates.filter((v) => v && typeof v === 'object'))]
+        if (distinct.length === 0) continue
+        let value = distinct[0]
+        if (distinct.length > 1) {
+          value = new UnionValue(undefined, undefined, `${scope.qid}.<union@label:${label}:${key}>`, undefined)
+          for (const v of distinct) value.appendValue(v)
+        }
+        if (value !== scope.getMemberValue(key)) scope.setMemberValue(key, value)
+      }
+    }
+  }
+
+  /**
+   * 标签语句：路径因 goto 不可达且标签是其目标时恢复执行。
+   * @param scope - 当前 scope
+   * @param node - LabeledStatement
+   * @param state - 状态
+   * @returns 语句结果
+   */
+  processLabeledStatement(scope: any, node: any, state: any): any {
+    const { flow } = this
+    const label = node?.label?.name
+    const resuming = flow.dead && flow.pending.has(label)
+    if (resuming) {
+      flow.dead = false
+      flow.reasons = new Set()
+    }
+    if (!flow.dead && label) this.joinLabelStates(label, resuming)
+    return node?.body ? this.processInstruction(scope, node.body, state) : new UndefinedValue()
+  }
+
+  /**
+   * if/switch 的一个分支：从可达状态开始执行，结束时记录分支的控制流状态。
+   * @param scope - 当前 scope
+   * @param node - 分支包装节点（type `CBranch`）
+   * @param state - 状态
+   * @returns UndefinedValue
+   */
+  processCBranch(scope: any, node: any, state: any): any {
+    const { flow } = this
+    flow.dead = false
+    flow.reasons = new Set()
+    const before = node.snapshot ? this.snapshotScopes(scope) : undefined
+    this.processInstruction(scope, node.body, state)
+    node.results.push({ dead: flow.dead, reasons: flow.reasons, before })
+    flow.dead = false
+    flow.reasons = new Set()
+    return new UndefinedValue()
+  }
+
+  /**
+   * 包装分支，使每个分支从可达状态开始并记录其结束状态
+   * @param body - 分支语句
+   * @param results - 结果收集
+   * @returns 包装节点
+   */
+  private branch(body: any, results: BranchResult[]): any {
+    if (!body || (body.type === 'Noop' && !body._meta?.goto)) return body
+    return { type: 'CBranch', body, results, loc: body.loc, _meta: {} }
+  }
+
+  /**
+   * 汇合分支：所有执行到的分支都突然完成时，if 之后不可达。
+   * @param results - 分支结果
+   * @param exhaustive - 分支是否覆盖所有路径（有 else / default）
+   * @param exclude - 在此语句处被消耗的种类（switch 的 break）
+   */
+  private joinBranches(results: BranchResult[], exhaustive: boolean, exclude?: Abrupt): void {
+    const { flow } = this
+    const allDead =
+      exhaustive && results.length > 0 && results.every((r) => r.dead && !(exclude && r.reasons.has(exclude)))
+    flow.dead = allDead
+    flow.reasons = new Set(allDead ? results.flatMap((r) => [...r.reasons]) : [])
+  }
+
+  /**
+   * 常量条件（`if (0)`、`if (1 - 1)`）只执行可达分支；其余情况两个分支都执行，
+   * 两者都 return/goto 时之后的语句不可达。
    * @param scope - 当前 scope
    * @param node - IfStatement
    * @param state - 状态
    * @returns 语句结果
    */
   override processIfStatement(scope: any, node: any, state: any): any {
-    const test = node?.test
-    if (test?.type === 'Literal' && (typeof test.value === 'number' || typeof test.value === 'boolean')) {
-      const branch = test.value ? node.consequent : node.alternative
-      return branch ? this.processInstruction(scope, branch, state) : new UndefinedValue()
+    const constant = foldConstant(node?.test)
+    if (constant !== undefined) {
+      const taken = constant ? node.consequent : node.alternative
+      return taken ? this.processInstruction(scope, taken, state) : new UndefinedValue()
     }
-    return super.processIfStatement(scope, node, state)
+    const results: BranchResult[] = []
+    const consequent = this.branch(node.consequent, results)
+    const alternative = this.branch(node.alternative, results)
+    // `if (c) { ...; return; }`：只有不进入分支的路径会继续执行，分支内的写入不应流到 if 之后
+    // （条件本身的副作用保留：快照在进入分支时、条件求值之后记录）
+    if (alternative === node.alternative && consequent?.type === 'CBranch') consequent.snapshot = true
+    const ret = super.processIfStatement(scope, { ...node, consequent, alternative }, state)
+    const result = results[0]
+    if (results.length === 1 && result.dead && result.before && [...result.reasons].every((r) => r === 'return')) {
+      this.restoreScopes(result.before)
+    }
+    this.joinBranches(results, alternative !== node.alternative)
+    return ret
   }
 
   /**
-   * do-while 至少执行一次循环体（引擎基类先判条件，`do { ... } while (0)` 会整体跳过）。
+   * switch：每个 case 独立执行；break 在 switch 处被消耗。
    * @param scope - 当前 scope
-   * @param node - WhileStatement
+   * @param node - SwitchStatement
    * @param state - 状态
    * @returns 语句结果
    */
-  override processWhileStatement(scope: any, node: any, state: any): any {
-    // 循环体顶层无条件 break/return：只会执行一次（`while (1) { ...; break; }`），不能按两轮展开
-    if (node?.isPostTest || endsUnconditionally(node?.body)) {
-      this.processInstruction(scope, node.body, state)
-      if (endsUnconditionally(node?.body)) return new UndefinedValue()
-    }
-    return super.processWhileStatement(scope, node, state)
+  override processSwitchStatement(scope: any, node: any, state: any): any {
+    const results: BranchResult[] = []
+    const cases = (node.cases || []).map((c: any) => ({ ...c, body: this.branch(c.body, results) }))
+    const ret = super.processSwitchStatement(scope, { ...node, cases }, state)
+    const hasDefault = cases.some((c: any) => !c.test || c.test.type === 'Noop')
+    this.joinBranches(results, hasDefault, 'break')
+    return ret
   }
 
   /**
-   * for 循环体顶层无条件 break/return 时只执行一次。
+   * 三目运算符：条件为常量时只求值被选中的分支
+   * @param scope - 当前 scope
+   * @param node - ConditionalExpression
+   * @param state - 状态
+   * @returns 值
+   */
+  override processConditionalExpression(scope: any, node: any, state: any): any {
+    const constant = foldConstant(node?.test)
+    if (constant === undefined) return super.processConditionalExpression(scope, node, state)
+    return this.processInstruction(scope, constant ? node.consequent : node.alternative, state)
+  }
+
+  /**
+   * `&&`/`||` 短路：左侧为常量且已决定结果时右侧不求值（`0 && (p = x)`）。
+   * @param scope - 当前 scope
+   * @param node - BinaryExpression
+   * @param state - 状态
+   * @returns 值
+   */
+  override processBinaryExpression(scope: any, node: any, state: any): any {
+    if (node?.operator === '&&' || node?.operator === '||') {
+      const left = foldConstant(node.left)
+      if (left !== undefined && (node.operator === '&&') === (left === 0)) {
+        const result = node.operator === '||' ? 1 : 0
+        return new PrimitiveValue(scope.qid, `<literal_${result}>`, result, 'number', 'Literal', node.loc)
+      }
+    }
+    const result = super.processBinaryExpression(scope, node, state)
+    return this.propagateNumeric(result, [result?.left, result?.right])
+  }
+
+  /**
+   * 执行一轮循环体
+   * @param scope - 当前 scope
+   * @param body - 循环体
+   * @param state - 状态
+   * @returns 循环体突然完成的种类；顺序执行到末尾时为 undefined
+   */
+  private runLoopBody(scope: any, body: any, state: any): Set<Abrupt> | undefined {
+    const { flow } = this
+    flow.dead = false
+    this.processInstruction(scope, body, state)
+    const reasons = flow.dead ? flow.reasons : undefined
+    flow.dead = false
+    flow.reasons = new Set()
+    return reasons
+  }
+
+  /**
+   * 循环按两轮展开（与引擎基类一致），并处理 break/continue/return：
+   * 条件为常量 0 时不执行；循环体无条件 break/return 时只执行一轮；
+   * 确定进入且以 return/goto 离开时，循环之后不可达。
+   * @param scope - 当前 scope
+   * @param node - ForStatement / WhileStatement
+   * @param state - 状态
+   * @param postTest - do-while
+   */
+  private runLoop(scope: any, node: any, state: any, postTest: boolean): void {
+    let entered = postTest
+    let exitReasons: Set<Abrupt> | undefined
+    for (let round = 0; round < 2; round++) {
+      if (!(postTest && round === 0)) {
+        const test = node.test ? foldConstant(node.test) : 1
+        if (node.test) this.processInstruction(scope, node.test, state)
+        if (test === 0) break
+        if (round === 0 && test !== undefined) entered = true
+      }
+      const reasons = this.runLoopBody(scope, node.body, state)
+      if (reasons && !reasons.has('continue')) {
+        exitReasons = reasons
+        break
+      }
+      if (node.update) this.processInstruction(scope, node.update, state)
+    }
+    const leaves = !!exitReasons && [...exitReasons].every((r) => r === 'return' || r === 'goto')
+    this.flow.dead = entered && leaves
+    this.flow.reasons = this.flow.dead ? exitReasons! : new Set()
+  }
+
+  /**
+   * @param scope - 当前 scope
+   * @param node - WhileStatement（isPostTest 为 do-while）
+   * @param state - 状态
+   * @returns UndefinedValue
+   */
+  override processWhileStatement(scope: any, node: any, state: any): any {
+    StateUtil.pushLoopInfo(state, node)
+    this.runLoop(scope, node, state, !!node?.isPostTest)
+    StateUtil.popLoopInfo(state)
+    return new UndefinedValue()
+  }
+
+  /**
    * @param scope - 当前 scope
    * @param node - ForStatement
    * @param state - 状态
-   * @returns 语句结果
+   * @returns UndefinedValue
    */
   override processForStatement(scope: any, node: any, state: any): any {
-    if (!endsUnconditionally(node?.body)) return super.processForStatement(scope, node, state)
+    StateUtil.pushLoopInfo(state, node)
     if (node.init) this.processInstruction(scope, node.init, state)
-    if (node.test) this.processInstruction(scope, node.test, state)
-    this.processInstruction(scope, node.body, state)
+    this.runLoop(scope, node, state, false)
+    StateUtil.popLoopInfo(state)
     return new UndefinedValue()
   }
 
@@ -483,17 +1073,6 @@ class CAnalyzer extends Analyzer {
     if (!pointee) return value
     const current = this.processInstruction(pointee.scope, pointee.node, state)
     return current ?? value
-  }
-
-  /**
-   * 标签语句：执行被标记的语句。goto 在 parser 中保留为 Noop，控制流按顺序近似。
-   * @param scope - 当前 scope
-   * @param node - LabeledStatement
-   * @param state - 状态
-   * @returns 语句结果
-   */
-  processLabeledStatement(scope: any, node: any, state: any): any {
-    return node?.body ? this.processInstruction(scope, node.body, state) : new UndefinedValue()
   }
 
   /**
@@ -514,9 +1093,17 @@ class CAnalyzer extends Analyzer {
    * @returns 调用返回值
    */
   override executeCall(node: any, fclos: any, state: any, scope: any, callInfo: any): any {
-    const ret = super.executeCall(node, fclos, state, scope, callInfo)
+    // 被调函数的 return 只结束被调函数
+    const callerFlow = this.flow
+    this.flow = liveFlow()
+    let ret
+    try {
+      ret = super.executeCall(node, fclos, state, scope, callInfo)
+    } finally {
+      this.flow = callerFlow
+    }
     if (node?.type === 'CallExpression' && !fclos?.ast?.fdef) {
-      applyCLibraryModel(this, node, scope, state, callInfo, ret)
+      applyCLibraryModel(this, node, scope, state, callInfo)
     }
     return ret
   }

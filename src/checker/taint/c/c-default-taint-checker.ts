@@ -20,6 +20,21 @@ const TAINT_TAG_NAME = 'C_INPUT'
 const MAIN_TAINTED_PARAMS = [1, 2]
 
 /**
+ * 数值污点（atoi(input) 的结果、按 %d 写入的数字文本）也危险的 sink：长度/大小，
+ * 以及格式串（数字可以选择位置参数 `%N$`、控制宽度）。命令/路径/SQL 等注入类 sink 不受数字影响。
+ */
+const NUMERIC_SENSITIVE_ATTRIBUTES = new Set(['CBufferOverflow', 'CFormatString'])
+
+/**
+ * @param rule - sink 规则
+ * @returns 数值污点对该 sink 是否危险
+ */
+function isNumericSensitiveSink(rule: any): boolean {
+  const attrs = Array.isArray(rule?.attribute) ? rule.attribute : [rule?.attribute]
+  return attrs.some((a: any) => NUMERIC_SENSITIVE_ATTRIBUTES.has(a))
+}
+
+/**
  * main 先执行，其余按文件与行号稳定排序，保证结果可复现
  * @param ep - entrypoint
  * @returns 排序键
@@ -223,7 +238,11 @@ class CDefaultTaintChecker extends TaintChecker {
     const rule: any = matched.length > 0 ? matched[0] : null
     if (!rule) return
 
-    const args = BasicRuleHandler.prepareArgs(callInfo, fclos, rule)
+    let args = BasicRuleHandler.prepareArgs(callInfo, fclos, rule)
+    if (!isNumericSensitiveSink(rule)) {
+      // 注入类 sink：数值污点不携带可注入的内容
+      args = args.filter((arg: any) => arg?.cNumericTaint !== true)
+    }
     const sanitizers = SanitizerChecker.findSanitizerByIds(rule.sanitizerIds)
     const results = SanitizerChecker.findTagAndMatchedSanitizer(
       node,

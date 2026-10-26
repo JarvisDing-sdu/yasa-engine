@@ -107,7 +107,7 @@
     "test-go-short-var-callback-taint": "npx mocha --require tsx/cjs test/rules-basic-handler/test-go-short-var-callback-taint.ts",
     "test-php-checker": "npx mocha --require tsx/cjs test/php/test-php-checker.ts",
     "test-php": "npx mocha --require tsx/cjs test/php/test-php-benchmark.ts",
-    "test-c": "npx mocha --require tsx/cjs test/c/test-c-checker.ts",
+    "test-c": "npx mocha --require tsx/cjs test/c/test-c-checker.ts test/c/test-c-semantics.ts",
     "update-php-expect": "YASA_UPDATE_PHP_BENCHMARK_EXPECT=1 npm run test-php && cp test/php/expect/phpbenchmark-expect.json.candidate test/php/expect/phpbenchmark-expect.json && rm test/php/expect/phpbenchmark-expect.json.candidate && npm run test-php",
     "test-all": "npm run test-callargs && npm run test-fastapi-backgroundtasks && npm run test-match-field && npm run test-entrypoint-deadline-budget && npm run test-entrypoint-deadline-scheduler && npm run test-clone-util && npm run test-sink-util-new-expr && npm run test-taint-output-strategy && npm run test-go-dynamic-key-taint && npm run test-js && npm run test-java && npm run test-sarif-codeflow-quality && npm run test-go && npm run test-python && npm run test-callchain && npm run test-php",
     "build": "bash build.sh",

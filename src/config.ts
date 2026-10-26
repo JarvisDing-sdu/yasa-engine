@@ -60,6 +60,14 @@ export interface IConfig {
   minEntryPointToEnablePrune?: number
   entryPointTimeoutMs?: number
   entryPointTimeoutQuickMs?: number
+  /** C 预处理配置（-D/-U、目标平台、未知宏的处理方式、头文件搜索目录） */
+  cPreprocessor?: {
+    defines: Record<string, string>
+    undefines: string[]
+    target: 'linux' | 'macos' | 'windows' | 'none'
+    unknownMacros: 'cover' | 'undefined'
+    includeDirs: string[]
+  }
   maxCallstackDepth?: number
   enableCoarseTaintPropagation?: boolean
   scanTimeoutMs?: number
@@ -221,6 +229,10 @@ const configObject: IConfig = {
   // Timeout
   entryPointTimeoutMs: 600000, // 重跑时每个入口点的超时上限（10 分钟）
   entryPointTimeoutQuickMs: 120000, // 首遍每个入口点的超时（2 分钟）
+
+  // C 预处理：默认按 Linux 上的 gcc/clang 预定义平台宏；代码与配置都未决定的宏（如 FEATURE）
+  // 按未知处理，#ifdef 两侧都分析（cover）。--cUnknownMacros undefined 时按 C 标准视为未定义。
+  cPreprocessor: { defines: {}, undefines: [], target: 'linux', unknownMacros: 'cover', includeDirs: [] },
   scanTimeoutMs: 28800000, // 全局扫描超时预算（8 小时），超时 entrypoint 重跑的时间来源
 
   // Memory guard: 单入口堆超阈提前 stop，flush 已分析入口 finding，跳下一入口（零污染，不改 clone）
