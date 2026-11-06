@@ -2,10 +2,9 @@ import * as assert from 'assert'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import { before, describe, it } from 'mocha'
+import { describe, it } from 'mocha'
 
-const { ensureInitialized, parseSingleFile: parseSingleFilePython } = require('../../src/engine/parser/python/python-ast-builder') as {
-  ensureInitialized: () => Promise<void>
+const { parseSingleFile: parseSingleFilePython } = require('../../src/engine/parser/python/python-ast-builder') as {
   parseSingleFile: (code: string, options: { uastSDKPath: string }) => unknown
 }
 const { findFastApiEntryPointAndSource } = require('../../src/engine/analyzer/python/fastapi/entrypoint-collector/fastapi-entrypoint') as {
@@ -39,10 +38,6 @@ type SarifResult = {
 }
 
 describe('FastAPI BackgroundTasks scanner integration', function () {
-  before(async function () {
-    await ensureInitialized()
-  })
-
   it('finds exactly the historical callback payload boundary and excludes the decoy', async function () {
     this.timeout(30000)
     const fixtureDir = path.join(__dirname, 'fastapi-backgroundtasks-cases')
