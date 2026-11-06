@@ -661,7 +661,7 @@ class BaseParser {
       language: 'python',
       unit: 'file',
       supportsIncremental: false,
-      parseAsFiles: true,
+      parseAsFiles: false,
       filePatterns: ['**/*.(py)', '!**/.venv/**', '!**/vendor/**', '!**/node_modules/**', '!**/site-packages/**'],
       parseSingleFile: (code, options) => {
         const PythonParser = require('./python/python-ast-builder')
@@ -1096,6 +1096,10 @@ class BaseParser {
               unit: config.unit,
               needsSourcefile: config.needsSourcefile,
               maindirPrefix: Config.maindirPrefix,
+              ...(language === 'c' ? {
+                maindir: Config.maindir,
+                cPreprocessor: Config.cPreprocessor,
+              } : {}),
             },
           })
 
@@ -1387,15 +1391,12 @@ const parser = new BaseParser()
  * synchronous parseSingleFile call is made by an analyzer.
  */
 async function ensureInitialized(language?: string): Promise<void> {
-  if (language === 'python') {
-    const PythonParser = require('./python/python-ast-builder')
-    await PythonParser.ensureInitialized()
+  if (language === 'c') {
+    const CParser = require('./c/c-ast-builder')
+    await CParser.ensureInitialized()
   } else if (language === 'php') {
     const PhpParser = require('./php/php-ast-builder')
     await PhpParser.ensureInitialized()
-  } else if (language === 'c') {
-    const CParser = require('./c/c-ast-builder')
-    await CParser.ensureInitialized()
   }
 }
 

@@ -905,8 +905,8 @@ async function initAnalyzer(dir: any, args: any[] = [], printf?: any) {
     Config.analyzer = f
     Analyzer = (analyzerEnum as any)[Config.analyzer]
   }
-  // Python, PHP and C load Tree-sitter WASM asynchronously, while analyzer
-  // internals use the synchronous parseSingleFile interface.
+  // C loads Tree-sitter WASM asynchronously, while analyzer internals use
+  // the synchronous parseSingleFile interface. Other languages retain upstream initialization.
   await Parser.ensureInitialized(Config.language)
   yasaLog(`Analysis language: ${Config.language}`, 'init')
   yasaLog(`Analysis analyzer: ${Config.analyzer}`, 'init')

@@ -2,6 +2,7 @@
  * 子进程脚本：在独立进程中解析文件（只做原始 parse，不含 processAst）
  * 子进程退出后 OS 立即回收内存，解决 worker_threads 共享 RSS 不释放问题
  */
+import type { IConfig } from '../../config'
 
 // 类型定义
 interface ParseTask {
@@ -13,6 +14,8 @@ interface ParseTask {
     unit: string
     needsSourcefile?: boolean
     maindirPrefix?: string
+    maindir?: string
+    cPreprocessor?: IConfig['cPreprocessor']
   }
 }
 
@@ -77,11 +80,11 @@ async function processParseTask(task: ParseTask): Promise<{ filepath: string; as
       await ensurePhpParserReady()
     }
     if (task.language === 'c') {
+      config.maindir = task.config.maindir
+      if (task.config.cPreprocessor) {
+        config.cPreprocessor = task.config.cPreprocessor
+      }
       await ensureCParserReady()
-    }
-    if (task.language === 'python') {
-      const PythonParser = require('./python/python-ast-builder')
-      await PythonParser.ensureInitialized()
     }
     const result = parseFileCore(task.filepath, task.content, task.language, task.options, task.config)
     deleteParent(result.ast)

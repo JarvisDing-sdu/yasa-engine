@@ -40,11 +40,11 @@ download_binaries() {
   echo "[INFO] Downloading latest release binaries for platform: $PLATFORM..."
 
   # Create target directories
-  mkdir -p deps/uast4go
+  mkdir -p deps/uast4go deps/uast4py
 
   # Define binaries and target paths
-  BINARIES=("uast4go-$PLATFORM")
-  TARGET_PATHS=("deps/uast4go/uast4go")
+  BINARIES=("uast4go-$PLATFORM" "uast4py-$PLATFORM")
+  TARGET_PATHS=("deps/uast4go/uast4go" "deps/uast4py/uast4py")
 
   for i in "${!BINARIES[@]}"; do
     BINARY=${BINARIES[$i]}
