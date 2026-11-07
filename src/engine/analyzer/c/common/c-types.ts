@@ -166,6 +166,41 @@ export class CTypeIndex {
   }
 
   /**
+   * 按位置的初始化列表按声明类型换成以字段名为键：parser 只认识本文件定义的 struct，
+   * 头文件中定义的 struct 的 `{ a, b }` 保留为 TupleExpression；字段顺序在此由类型索引给出。
+   * 数组元素与嵌套 struct 成员递归处理。
+   * @param init - 初始化表达式
+   * @param type - 声明类型
+   * @param depth - 递归深度
+   * @returns 键化后的初始化表达式；无法确定时原样返回
+   */
+  keyInitializer(init: any, type: any, depth = 0): any {
+    if (!init?._meta?.initializerList || depth > 16) return init
+    const element = this.isArray(type) ? this.elementOf(type) : undefined
+    if (init.type === 'ObjectExpression') {
+      const fields = element ? undefined : this.fieldsOf(type)
+      if (!element && !fields) return init
+      const properties = (init.properties || []).map((p: any) => {
+        const memberType = element ?? fields!.get(p?.key?.name)
+        const value = this.keyInitializer(p?.value, memberType, depth + 1)
+        return value === p?.value ? p : { ...p, value }
+      })
+      return { ...init, properties }
+    }
+    const fields = init.type === 'TupleExpression' && !element ? this.fieldsOf(type) : undefined
+    if (!fields) return init
+    const names = [...fields.keys()]
+    const properties = (init.elements || []).slice(0, names.length).map((value: any, i: number) => ({
+      type: 'ObjectProperty',
+      key: { type: 'Identifier', name: names[i], loc: value?.loc, _meta: {} },
+      value: this.keyInitializer(value, fields.get(names[i]), depth + 1),
+      loc: value?.loc,
+      _meta: {},
+    }))
+    return { ...init, type: 'ObjectExpression', properties, elements: undefined }
+  }
+
+  /**
    * 表达式的声明类型
    * @param node - 表达式
    * @returns 类型；未知时为 undefined

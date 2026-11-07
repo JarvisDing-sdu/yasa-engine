@@ -1,0 +1,159 @@
+{
+ "A1_header_struct": {
+  "impl.c:run": {
+   "must": [
+    "my_init",
+    "my_upd"
+   ],
+   "mustNot": []
+  }
+ },
+ "A1c_local_struct": {
+  "impl.c:run": {
+   "must": [
+    "my_init",
+    "my_upd"
+   ],
+   "mustNot": []
+  }
+ },
+ "A2_table_header": {
+  "enc.c:read_part": {
+   "must": [
+    "enc_nop",
+    "enc_b64"
+   ],
+   "mustNot": []
+  }
+ },
+ "A2c_table_local": {
+  "enc.c:read_part": {
+   "must": [
+    "enc_nop",
+    "enc_b64"
+   ],
+   "mustNot": []
+  }
+ },
+ "B1_field_same_file": {
+  "w.c:wc_free": {
+   "must": [
+    "wc_data_dtor"
+   ],
+   "mustNot": []
+  }
+ },
+ "B2_field_cross_file": {
+  "parser.c:wc_free": {
+   "must": [
+    "wc_data_dtor"
+   ],
+   "mustNot": []
+  }
+ },
+ "B3_macro_setup": {
+  "pp.c:pp_statemach": {
+   "must": [
+    "ftp_sm",
+    "ftp_eor",
+    "smtp_sm",
+    "smtp_eor"
+   ],
+   "mustNot": []
+  }
+ },
+ "C_local_probe": {
+  "probe.c:c_global_direct": {
+   "must": [
+    "my_init"
+   ],
+   "mustNot": []
+  },
+  "probe.c:c_global_ptr": {
+   "must": [
+    "my_init"
+   ],
+   "mustNot": []
+  },
+  "probe.c:c_designated": {
+   "must": [
+    "my_init"
+   ],
+   "mustNot": []
+  },
+  "probe.c:c_local_positional": {
+   "must": [
+    "my_init"
+   ],
+   "mustNot": []
+  },
+  "probe.c:c_field_assign": {
+   "must": [
+    "my_init"
+   ],
+   "mustNot": []
+  },
+  "probe.c:run": {
+   "must": [
+    "my_init"
+   ],
+   "mustNot": []
+  }
+ },
+ "C_header_probe": {
+  "probe.c:c_global_direct": {
+   "must": [
+    "my_init"
+   ],
+   "mustNot": []
+  },
+  "probe.c:c_global_ptr": {
+   "must": [
+    "my_init"
+   ],
+   "mustNot": []
+  },
+  "probe.c:c_designated": {
+   "must": [
+    "my_init"
+   ],
+   "mustNot": []
+  },
+  "probe.c:c_local_positional": {
+   "must": [
+    "my_init"
+   ],
+   "mustNot": []
+  },
+  "probe.c:c_field_assign": {
+   "must": [
+    "my_init"
+   ],
+   "mustNot": []
+  },
+  "probe.c:run": {
+   "must": [
+    "my_init"
+   ],
+   "mustNot": []
+  }
+ },
+ "D_type_separation": {
+  "sep.c:call_a": {
+   "must": [
+    "a_impl"
+   ],
+   "mustNot": [
+    "b_impl"
+   ]
+  },
+  "sep.c:call_b": {
+   "must": [
+    "b_impl"
+   ],
+   "mustNot": [
+    "a_impl"
+   ]
+  }
+ }
+}
