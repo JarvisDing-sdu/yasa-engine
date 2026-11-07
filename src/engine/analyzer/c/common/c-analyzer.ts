@@ -19,6 +19,7 @@ const { applyCLibraryModel } = require('./builtins/c-builtins')
 const StateUtil = require('../../../util/state-util')
 const { foldConstant } = require('./c-const-eval')
 const { CTypeIndex } = require('./c-types')
+const { CCallbackIndex } = require('./c-callbacks')
 
 const {
   valueUtil: {
@@ -180,6 +181,9 @@ class CAnalyzer extends Analyzer {
   /** 声明类型索引 */
   private types = new CTypeIndex()
 
+  /** 函数指针字段的回调汇总（--dumpAllCG） */
+  private callbacks = new CCallbackIndex(this.types)
+
   /** 当前函数体的控制流状态；每次函数调用独立 */
   private flow: ControlFlow = liveFlow()
 
@@ -286,6 +290,7 @@ class CAnalyzer extends Analyzer {
     if (m && typeof m === 'object') return m
 
     this.types.annotate(ast)
+    this.callbacks.collect(ast, filename)
     const modClos = this.initModuleScope(ast, filename)
     this.importHeaderStatics(ast, modClos)
     this.topScope.context.modules.members.set(filename, modClos.getFieldValue('module.exports'))
@@ -436,6 +441,7 @@ class CAnalyzer extends Analyzer {
       return new PrimitiveValue(scope.qid, `<${callee.name}>`, null, 'number', 'Literal', node.loc)
     }
     const result = super.processCallExpression(scope, node, state)
+    if (config.makeAllCG) this.reportCallbackTargets(scope, node, state)
     if (callee?.type === 'Identifier' && NUMERIC_CONVERSIONS.has(callee.name)) {
       // 整数无法携带命令/路径/SQL/格式串注入，但仍由输入决定：保留为数值污点，供长度类 sink 使用
       if (!result?.taint?.isTaintedRec || typeof result !== 'object') {
@@ -445,6 +451,31 @@ class CAnalyzer extends Analyzer {
       return result
     }
     return result
+  }
+
+  /**
+   * 完整调用图：通过函数指针字段的调用（`x->f(...)`），把汇总中写入该字段的每个函数
+   * 报告给调用图 checker。只记录调用边，不执行候选函数，污点分析不受影响。
+   * @param scope - 当前 scope
+   * @param node - CallExpression
+   * @param state - 状态
+   */
+  private reportCallbackTargets(scope: any, node: any, state: any): void {
+    if (!this.checkerManager?.checkAtFunctionCallBefore) return
+    for (const { name, file } of this.callbacks.candidatesFor(node?.callee)) {
+      const value = this.moduleScopes.get(file)?.value?.[name] ?? this.topScope.value[name]
+      for (const fclos of definitionsOf(value)) {
+        this.checkerManager.checkAtFunctionCallBefore(this, scope, node, state, {
+          fclos,
+          pcond: state.pcond,
+          entry_fclos: this.entry_fclos,
+          einfo: state.einfo,
+          state,
+          analyzer: this,
+          ainfo: this.ainfo,
+        })
+      }
+    }
   }
 
   /**
@@ -534,9 +565,13 @@ class CAnalyzer extends Analyzer {
       const init = { type: 'ObjectExpression', properties: [], loc: node.loc, _meta: { aggregate: true } }
       return super.processVariableDeclaration(target, { ...node, init }, state)
     }
-    const value = super.processVariableDeclaration(target, node, state)
+    const init = this.types.keyInitializer(node.init, node.varType)
+    // 存放在 topScope 的变量，其初始化器仍按本编译单元的名字解析（如 `{ my_static_fn }`），
+    // 否则本文件的 static 函数/变量在 topScope 中找不到
+    const declared = target !== scope && init ? { ...node, init: this.processInstruction(scope, init, state) } : { ...node, init }
+    const value = super.processVariableDeclaration(target, declared, state)
     // `struct S b = a;`：b 是 a 的副本，而不是同一个对象
-    if (node.init && node.init.type !== 'ObjectExpression' && this.types.isStruct(node.varType)) {
+    if (init && init.type !== 'ObjectExpression' && this.types.isStruct(node.varType)) {
       const copy = this.copyAggregate(value, node.varType, target)
       if (copy !== value) this.saveVarInCurrentScope(target, node.id, copy, state)
       return copy
@@ -569,7 +604,9 @@ class CAnalyzer extends Analyzer {
       const member = value.getMemberValue(key)
       const memberType = fieldTypes ? fieldTypes.get(key) : elementType
       const byValue = memberType && (this.types.isStruct(memberType) || this.types.isArray(memberType))
-      copy.setMemberValue(key, byValue ? this.copyAggregate(member, memberType, scope, depth + 1) : member)
+      // 成员副本放在外层副本之下：同一行的嵌套初始化列表 sid 相同（`<object_行_行>`），
+      // 若与外层副本同处一个 scope，二者 qid 冲突，成员值会丢失
+      copy.setMemberValue(key, byValue ? this.copyAggregate(member, memberType, copy, depth + 1) : member)
     }
     return copy
   }
