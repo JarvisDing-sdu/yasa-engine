@@ -70,6 +70,14 @@ async function ensureCParserReady(): Promise<void> {
   cInitialized = true
 }
 
+let cppInitialized = false
+async function ensureCppParserReady(): Promise<void> {
+  if (cppInitialized) return
+  const CppParser = require('./cpp/cpp-ast-builder')
+  await CppParser.ensureInitialized()
+  cppInitialized = true
+}
+
 async function processParseTask(task: ParseTask): Promise<{ filepath: string; ast: any; error?: string }> {
   if (task.config.maindirPrefix !== undefined) {
     config.maindirPrefix = task.config.maindirPrefix
@@ -79,12 +87,12 @@ async function processParseTask(task: ParseTask): Promise<{ filepath: string; as
     if (task.language === 'php') {
       await ensurePhpParserReady()
     }
-    if (task.language === 'c') {
+    if (task.language === 'c' || task.language === 'cpp') {
       config.maindir = task.config.maindir
       if (task.config.cPreprocessor) {
         config.cPreprocessor = task.config.cPreprocessor
       }
-      await ensureCParserReady()
+      await (task.language === 'cpp' ? ensureCppParserReady() : ensureCParserReady())
     }
     const result = parseFileCore(task.filepath, task.content, task.language, task.options, task.config)
     deleteParent(result.ast)

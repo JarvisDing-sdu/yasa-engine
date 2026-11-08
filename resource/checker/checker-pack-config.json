@@ -210,6 +210,15 @@
     "description": "C污点追踪-对外默认使用的规则包"
   },
   {
+    "checkerPackId": "taint-flow-cpp-default",
+    "checkerIds": [
+      "taint_flow_cpp_input",
+      "callgraph",
+      "sanitizer"
+    ],
+    "description": "C++污点追踪-对外默认使用的规则包"
+  },
+  {
     "checkerPackId": "callchain-php",
     "checkerIds": [
       "callchain_php"

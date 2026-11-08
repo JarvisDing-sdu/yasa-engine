@@ -96,6 +96,12 @@ function getParser(language: string): ((code: string, options: Record<string, an
       parsers.c = parser
       break
     }
+    case 'cpp': {
+      const CppParser = require('./cpp/cpp-ast-builder')
+      parser = (c: string, opts: Record<string, any>) => CppParser.parseSingleFile(c, opts)
+      parsers.cpp = parser
+      break
+    }
     default:
       throw new Error(`Unsupported language: ${language}`)
   }
