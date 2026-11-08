@@ -92,9 +92,10 @@ class CDefaultTaintChecker extends TaintChecker {
 
   /**
    * @param resultManager
+   * @param checkerId - checker id (C++ reuses this checker under its own id)
    */
-  constructor(resultManager: any) {
-    super(resultManager, 'taint_flow_c_input')
+  constructor(resultManager: any, checkerId: string = 'taint_flow_c_input') {
+    super(resultManager, checkerId)
     this.entryPoints = []
   }
 

@@ -95,13 +95,6 @@ function isConditional(fclos: any): boolean {
   return !!fclos?.ast?.fdef?._meta?.conditional
 }
 
-/**
- * @param fclos - 函数值
- * @returns 是否定义在头文件中
- */
-function isHeaderDefinition(fclos: any): boolean {
-  return String(fclos?.ast?.fdef?.loc?.sourcefile ?? '').endsWith('.h')
-}
 
 /** 不可达代码中仍需处理的定义（函数、struct） */
 const HOISTED = new Set(['FunctionDefinition', 'ClassDefinition'])
@@ -180,6 +173,33 @@ class CAnalyzer extends Analyzer {
 
   /** 声明类型索引 */
   private types = new CTypeIndex()
+
+  /** Language id reported to the entrypoint executor */
+  protected readonly languageId: string = 'c'
+
+  /**
+   * @param file - 文件名
+   * @returns 是否为头文件
+   */
+  protected isHeaderFile(file: string): boolean {
+    return file.endsWith('.h')
+  }
+
+  /**
+   * @param file - 文件名
+   * @returns 是否为源文件（编译单元）
+   */
+  protected isSourceFile(file: string): boolean {
+    return file.endsWith('.c')
+  }
+
+  /**
+   * @param fclos - 函数值
+   * @returns 是否定义在头文件中
+   */
+  protected isHeaderDefinition(fclos: any): boolean {
+    return this.isHeaderFile(String(fclos?.ast?.fdef?.loc?.sourcefile ?? ''))
+  }
 
   /** 函数指针字段的回调汇总（--dumpAllCG） */
   private callbacks = new CCallbackIndex(this.types)
@@ -263,7 +283,7 @@ class CAnalyzer extends Analyzer {
     this.performanceTracker.start('preProcess.processModule')
     // Headers first so that a definition in a .c file wins over a header's
     // static inline or macro-generated duplicate.
-    const filenames = Object.keys(astMap).sort((a, b) => Number(a.endsWith('.c')) - Number(b.endsWith('.c')))
+    const filenames = Object.keys(astMap).sort((a, b) => Number(this.isSourceFile(a)) - Number(this.isSourceFile(b)))
     for (const filename of filenames) {
       const ast = astMap[filename]
       if (ast) this.processModule(ast, filename)
@@ -378,7 +398,7 @@ class CAnalyzer extends Analyzer {
     const fclos = super.processFunctionDefinition(scope, node, state)
     if (!scope?.isCModule || !name || !node.body || !fclos) return fclos
     const isStatic = (node.modifiers || []).includes('static')
-    const inHeader = String(node.loc?.sourcefile ?? '').endsWith('.h')
+    const inHeader = this.isHeaderFile(String(node.loc?.sourcefile ?? ''))
     let value = fclos
     if (previous && previous !== fclos && (node._meta?.conditional || definitionsOf(previous).some(isConditional))) {
       value = this.unionDefinitions(scope, name, [previous, fclos])
@@ -390,7 +410,7 @@ class CAnalyzer extends Analyzer {
       this.topScope.value[name] = value
     } else if (value !== fclos || (node._meta?.conditional && definitionsOf(existing).some(isConditional))) {
       this.topScope.value[name] = this.unionDefinitions(this.topScope, name, [existing, value])
-    } else if (definitionsOf(existing).every((f: any) => isHeaderDefinition(f)) && !inHeader) {
+    } else if (definitionsOf(existing).every((f: any) => this.isHeaderDefinition(f)) && !inHeader) {
       // .c 中的定义优先于头文件中的同名定义
       this.topScope.value[name] = value
     }
@@ -1211,7 +1231,7 @@ class CAnalyzer extends Analyzer {
             epTotal: entryPoints.length,
           },
           {
-            language: 'c',
+            language: this.languageId,
             classify: () => 'function',
             execute: () => {
               // 参数值创建后再触发 Before hook，避免 argv 的 taint 被覆盖

@@ -97,4 +97,5 @@ module.exports = {
   ensureInitialized,
   parseSingleFile,
   parseProject,
+  preprocessorOptions,
 }
