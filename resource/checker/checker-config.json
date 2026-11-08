@@ -191,6 +191,12 @@
     "demoRuleConfigPath": "resource/example-rule-config/rule_config_c.json"
   },
   {
+    "checkerId": "taint_flow_cpp_input",
+    "checkerPath": "checker/taint/cpp/cpp-default-taint-checker.ts",
+    "description": "C++污点分析checker，source/sink与entrypoint选择同C，支持命名空间",
+    "demoRuleConfigPath": "resource/example-rule-config/rule_config_cpp.json"
+  },
+  {
     "checkerId": "taint_flow_test",
     "checkerPath": "checker/taint/test-taint-checker.ts",
     "description": "taint_flow_test，回归测试使用，不推荐外部使用",

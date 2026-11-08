@@ -318,13 +318,13 @@ async function initAnalyzer(dir: any, args: any[] = [], printf?: any) {
         setExitCode(ErrorCode.config_error)
       }
     })
-    .option('--language <lang>', '指定语言（支持: javascript/typescript/golang/python/java/php/c）', (lang: any) => {
-      const supported = ['javascript', 'typescript', 'js', 'ts', 'go', 'golang', 'python', 'java', 'php', 'c']
+    .option('--language <lang>', '指定语言（支持: javascript/typescript/golang/python/java/php/c/cpp）', (lang: any) => {
+      const supported = ['javascript', 'typescript', 'js', 'ts', 'go', 'golang', 'python', 'java', 'php', 'c', 'cpp']
       if (!supported.includes(lang)) {
         handleException(
           null,
-          'Unknown language!! Only support javascript/typescript/golang/python/java/php/c',
-          'Unknown language!! Only support javascript/typescript/golang/python/java/php/c'
+          'Unknown language!! Only support javascript/typescript/golang/python/java/php/c/cpp',
+          'Unknown language!! Only support javascript/typescript/golang/python/java/php/c/cpp'
         )
         initError = true
         setExitCode(ErrorCode.config_error)
@@ -837,6 +837,8 @@ async function initAnalyzer(dir: any, args: any[] = [], printf?: any) {
 
   const CAnalyzer = require('../engine/analyzer/c/common/c-analyzer')
 
+  const CppAnalyzer = require('../engine/analyzer/cpp/common/cpp-analyzer')
+
   const analyzerEnum = {
     EggAnalyzer,
     JavaScriptAnalyzer,
@@ -846,6 +848,7 @@ async function initAnalyzer(dir: any, args: any[] = [], printf?: any) {
     PythonAnalyzer,
     PhpAnalyzer,
     CAnalyzer,
+    CppAnalyzer,
   }
   const analyzerLanguage = {
     EggAnalyzer: 'javascript',
@@ -856,6 +859,7 @@ async function initAnalyzer(dir: any, args: any[] = [], printf?: any) {
     PythonAnalyzer: 'python',
     PhpAnalyzer: 'php',
     CAnalyzer: 'c',
+    CppAnalyzer: 'cpp',
   }
 
   let Analyzer: any
@@ -865,8 +869,8 @@ async function initAnalyzer(dir: any, args: any[] = [], printf?: any) {
     if (!Analyzer || Analyzer === '') {
       handleException(
         null,
-        'analyzer set failed,now YASA supported EggAnalyzer|JavaScriptAnalyzer|JavaAnalyzer|SpringAnalyzer|GoAnalyzer|PythonAnalyzer|PhpAnalyzer|CAnalyzer',
-        'analyzer set failed,now YASA supported EggAnalyzer|JavaScriptAnalyzer|JavaAnalyzer|SpringAnalyzer|GoAnalyzer|PythonAnalyzer|PhpAnalyzer|CAnalyzer'
+        'analyzer set failed,now YASA supported EggAnalyzer|JavaScriptAnalyzer|JavaAnalyzer|SpringAnalyzer|GoAnalyzer|PythonAnalyzer|PhpAnalyzer|CAnalyzer|CppAnalyzer',
+        'analyzer set failed,now YASA supported EggAnalyzer|JavaScriptAnalyzer|JavaAnalyzer|SpringAnalyzer|GoAnalyzer|PythonAnalyzer|PhpAnalyzer|CAnalyzer|CppAnalyzer'
       )
       return
     }
@@ -896,6 +900,9 @@ async function initAnalyzer(dir: any, args: any[] = [], printf?: any) {
           break
         case 'c':
           f = 'CAnalyzer'
+          break
+        case 'cpp':
+          f = 'CppAnalyzer'
           break
         default:
           handleException(null, 'default analyzer set failed', 'default analyzer set failed')
@@ -1000,6 +1007,9 @@ function loadSource(absdirs: any) {
       break
     case 'c':
       fext = ['c', 'h']
+      break
+    case 'cpp':
+      fext = ['cpp', 'cc', 'cxx', 'c++', 'hpp', 'hh', 'hxx', 'h', 'inl']
       break
     default:
       // Keep default .sol extension for unknown languages
@@ -1173,6 +1183,15 @@ function detectFileLanguage(filename: any) {
     case 'c':
     case 'h':
       return 'c'
+    case 'cpp':
+    case 'cc':
+    case 'cxx':
+    case 'c++':
+    case 'hpp':
+    case 'hh':
+    case 'hxx':
+    case 'inl':
+      return 'cpp'
     default:
       return null
   }

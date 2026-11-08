@@ -5,7 +5,6 @@ const BasicRuleHandler = require('../../../../checker/common/rules-basic-handler
 const Parser = require('../../../parser/parser')
 const AstUtil = require('../../../../util/ast-util')
 const SourceLine = require('../../common/source-line')
-const CAstBuilder = require('../../../parser/c/c-ast-builder')
 const logger: import('../../../../util/logger').Logger = require('../../../../util/logger')(__filename)
 const { ErrorCode } = require('../../../../util/error-code')
 const Statistics = require('../../../../util/statistics')
@@ -236,7 +235,7 @@ class CAnalyzer extends Analyzer {
   async preProcess4SingleFile(source: any, fileName: any) {
     this.initTopScope()
     this.state = this.initState(this.topScope)
-    await CAstBuilder.ensureInitialized()
+    await Parser.ensureInitialized(this.languageId)
 
     this.performanceTracker.start('preProcess.parseCode')
     const { options } = this
@@ -264,7 +263,7 @@ class CAnalyzer extends Analyzer {
    * @param dir - 项目目录
    */
   async scanModules(dir: any) {
-    await CAstBuilder.ensureInitialized()
+    await Parser.ensureInitialized(this.languageId)
 
     this.performanceTracker.start('preProcess.parseCode')
     const astMap = await Parser.parseProject(dir, this.options, this.sourceCodeCache)

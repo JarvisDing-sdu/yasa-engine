@@ -732,6 +732,25 @@ class BaseParser {
       },
       needsSourcefile: true,
     })
+
+    // 注册 C++ 解析器（tree-sitter-cpp；cpp 模式下 .h 按 C++ 解析，.c 不参与）
+    this.registry.register({
+      language: 'cpp',
+      unit: 'file',
+      supportsIncremental: false,
+      parseAsFiles: true,
+      filePatterns: ['**/*.cpp', '**/*.cc', '**/*.cxx', '**/*.c++', '**/*.hpp', '**/*.hh', '**/*.hxx', '**/*.h', '**/*.inl'],
+      parseSingleFile: (code, options) => {
+        const CppParser = require('./cpp/cpp-ast-builder')
+        return CppParser.parseSingleFile(code, options)
+      },
+      parseProject: async () => {
+        const CppParser = require('./cpp/cpp-ast-builder')
+        await CppParser.ensureInitialized()
+        return null
+      },
+      needsSourcefile: true,
+    })
   }
 
   /**
@@ -1096,7 +1115,7 @@ class BaseParser {
               unit: config.unit,
               needsSourcefile: config.needsSourcefile,
               maindirPrefix: Config.maindirPrefix,
-              ...(language === 'c' ? {
+              ...(language === 'c' || language === 'cpp' ? {
                 maindir: Config.maindir,
                 cPreprocessor: Config.cPreprocessor,
               } : {}),
@@ -1394,6 +1413,9 @@ async function ensureInitialized(language?: string): Promise<void> {
   if (language === 'c') {
     const CParser = require('./c/c-ast-builder')
     await CParser.ensureInitialized()
+  } else if (language === 'cpp') {
+    const CppParser = require('./cpp/cpp-ast-builder')
+    await CppParser.ensureInitialized()
   } else if (language === 'php') {
     const PhpParser = require('./php/php-ast-builder')
     await PhpParser.ensureInitialized()

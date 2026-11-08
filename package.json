@@ -39,7 +39,8 @@
     "tsx": "^4.21.0",
     "underscore": "^1.9.1",
     "xml2js": "^0.6.2",
-    "@ant-yasa/uast-parser-c": "file:../uast/parser-C"
+    "@ant-yasa/uast-parser-c": "file:../uast/parser-C",
+    "@ant-yasa/uast-parser-cpp": "file:../uast/parser-CPP"
   },
   "devDependencies": {
     "@babel/plugin-syntax-top-level-await": "^7.14.5",
@@ -122,7 +123,8 @@
     "test-change-impact": "npx mocha --require tsx/cjs tools/change-impact/impact-lookup.test.ts",
     "test-entrypoint-deadline-budget": "npx mocha --require tsx/cjs test/entrypoint-deadline-budget.test.ts",
     "test-entrypoint-deadline-scheduler": "npx mocha --require tsx/cjs test/entrypoint-deadline-scheduler.test.ts",
-    "test-c": "npx mocha --require tsx/cjs test/c/test-c-checker.ts test/c/test-c-semantics.ts test/c/test-c-worker-config.ts test/c/test-c-callgraph.ts"
+    "test-c": "npx mocha --require tsx/cjs test/c/test-c-checker.ts test/c/test-c-semantics.ts test/c/test-c-worker-config.ts test/c/test-c-callgraph.ts",
+    "test-cpp": "npx mocha --require tsx/cjs test/cpp/test-cpp.ts"
   },
   "install": "npm install",
   "files": [
