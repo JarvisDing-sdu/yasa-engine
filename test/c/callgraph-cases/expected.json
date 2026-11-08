@@ -155,5 +155,13 @@
     "a_impl"
    ]
   }
+ },
+ "E_stray_toplevel_return": {
+  "main.c:caller": {
+   "must": [
+    "leaf"
+   ],
+   "mustNot": []
+  }
  }
 }

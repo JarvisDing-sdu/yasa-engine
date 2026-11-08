@@ -352,6 +352,9 @@ class CAnalyzer extends Analyzer {
     this.thisFClos = modClos
 
     const state = this.initState(modClos)
+    // 每个编译单元从可达状态开始：解析错误恢复可能在文件顶层留下 return/break，
+    // 它们不能让之后处理的文件整体被当作不可达代码跳过
+    this.flow = liveFlow()
     this.processInstruction(modClos, node, state)
 
     if (this.checkerManager && this.checkerManager.checkAtEndOfCompileUnit) {
