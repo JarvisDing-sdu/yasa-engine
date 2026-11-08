@@ -1,3 +1,4 @@
+#include <stdlib.h>
 namespace api {
-void exec(char *s);
+inline char *input() { return getenv("X"); }
 }

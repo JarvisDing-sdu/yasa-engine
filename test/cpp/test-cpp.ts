@@ -1,5 +1,6 @@
 import * as path from 'path'
 import * as fs from 'fs'
+import * as os from 'os'
 import { describe, it, before } from 'mocha'
 import * as assert from 'assert'
 const { execute } = require('../../src/interface/starter')
@@ -48,7 +49,6 @@ async function readJson(file: string): Promise<any> {
  * @returns 报告中各结果的 sink 文件（相对 sourceDir）
  */
 async function scanFindings(sourceDir: string, reportDir: string): Promise<string[]> {
-  fs.rmSync(reportDir, { recursive: true, force: true })
   resetConfig()
   await execute(null, [
     sourceDir, '--language', 'cpp', '--ruleConfigFile', RULE_CONFIG,
@@ -85,7 +85,7 @@ describe('C++ Regression Tests (taint-flow-cpp-default)', function () {
   const detected = new Set<string>()
 
   before(async function () {
-    for (const file of await scanFindings(CASES_DIR, path.resolve('/tmp', 'cpp-test', 'cases'))) {
+    for (const file of await scanFindings(CASES_DIR, fs.mkdtempSync(path.join(os.tmpdir(), 'cpp-cases-')))) {
       detected.add(file.split(path.sep)[0].replace(/\.cpp$/, ''))
     }
   })
@@ -97,16 +97,21 @@ describe('C++ Regression Tests (taint-flow-cpp-default)', function () {
   }
 
   it('cpp mode ignores .c files and parses .h as C++', async function () {
-    const files = await scanFindings(MIXED_DIR, path.resolve('/tmp', 'cpp-test', 'mixed'))
+    const files = await scanFindings(MIXED_DIR, fs.mkdtempSync(path.join(os.tmpdir(), 'cpp-mixed-')))
     assert.deepStrictEqual([...new Set(files)], ['main.cpp'])
+    const Parser = require('../../src/engine/parser/parser')
+    const units = await Parser.parseProject(MIXED_DIR, { language: 'cpp' })
+    assert.ok(Object.keys(units).some((f) => f.endsWith('/api.h')))
+    assert.ok(!Object.keys(units).some((f) => f.endsWith('/helper.c')))
+    for (const ast of Object.values<any>(units)) {
+      assert.strictEqual(ast.language, 'cpp')
+      assert.deepStrictEqual(ast._meta.parseErrors, [])
+    }
   })
 
   it('dumps a call graph in cpp mode', async function () {
-    const reportDir = path.resolve('/tmp', 'cpp-test', 'callgraph')
-    const caseDir = path.resolve('/tmp', 'cpp-test', 'callgraph-src')
-    fs.rmSync(reportDir, { recursive: true, force: true })
-    fs.rmSync(caseDir, { recursive: true, force: true })
-    fs.mkdirSync(caseDir, { recursive: true })
+    const reportDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cpp-callgraph-'))
+    const caseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cpp-callgraph-src-'))
     fs.copyFileSync(path.join(CASES_DIR, 'namespace_call_T.cpp'), path.join(caseDir, 'namespace_call_T.cpp'))
     resetConfig()
     await execute(null, [
