@@ -35,6 +35,18 @@ function validateIncrementalModeLazy(mode: string | undefined): import('../confi
 
 const CALL_SUMMARY_MODES = ['off', 'only-preprocess', 'on'] as const
 
+const analyzerLanguage: Record<string, string> = {
+  EggAnalyzer: 'javascript',
+  JavaScriptAnalyzer: 'javascript',
+  JavaAnalyzer: 'java',
+  SpringAnalyzer: 'java',
+  GoAnalyzer: 'golang',
+  PythonAnalyzer: 'python',
+  PhpAnalyzer: 'php',
+  CAnalyzer: 'c',
+  CppAnalyzer: 'cpp',
+}
+
 type CallSummaryMode = (typeof CALL_SUMMARY_MODES)[number]
 type CallSummaryStageStrategy = 'bypass' | 'skip-only'
 type CallSummaryStageName = 'processModule' | 'symbolInterpret'
@@ -281,6 +293,8 @@ async function initAnalyzer(dir: any, args: any[] = [], printf?: any) {
   }
   // 标记初始化是否遇到致命错误
   let initError = false
+  let inferredLanguage = false
+  let languageBeforeInference: any
   // 标记是否显式设置了 --intermediate-dir
   let intermediateDirExplicitlySet = false
   // 标记是否显式设置了 --context-environment-dir
@@ -717,9 +731,14 @@ async function initAnalyzer(dir: any, args: any[] = [], printf?: any) {
     }
   }
   if (Config.maindir && Config.maindir !== '') {
-    if (Config.single) {
+    if (Config.analyzer && analyzerLanguage[Config.analyzer]) {
+      Config.language = analyzerLanguage[Config.analyzer]
+    }
+    if (Config.single && !Config.language) {
       const lang = detectFileLanguage(Config.maindir)
       if (lang) {
+        inferredLanguage = true
+        languageBeforeInference = Config.language
         Config.language = lang
       } else {
         logger.info(
@@ -770,33 +789,40 @@ async function initAnalyzer(dir: any, args: any[] = [], printf?: any) {
 
   // dump AST and other single-file paths call parseSingleFile synchronously.
   // Initialize WASM-backed parsers before entering those paths.
-  if (Config.language) {
+  if (Config.language && !Config.dumpAST) {
     await Parser.ensureInitialized(Config.language)
   }
 
   // dump AST
   if (Config.dumpAST) {
-    if (!Config.single) {
-      Errors.ParseError('Only support dump AST for single file, but given a dir')
-      setExitCode(ErrorCode.config_error)
+    try {
+      if (Config.language) await Parser.ensureInitialized(Config.language)
+      if (!Config.single) {
+        Errors.ParseError('Only support dump AST for single file, but given a dir')
+        setExitCode(ErrorCode.config_error)
+        return null
+      }
+      // read and parse the source file(s)
+      const apps = loadSource(Config.maindir)
+      // logger.info("apps: " + JSON.stringify(apps));
+      if (apps.length === 0) {
+        const ecode = ErrorCode.no_valid_source_file
+        handleException(null, `ERROR: ${ErrorCode.toString(ecode)}`, `ERROR: ${ErrorCode.toString(ecode)}`)
+        process.exitCode = ecode
+        return
+      }
+      if (Config.ASTFileOutput) {
+        await dumpAST(apps, fs.writeFileSync)
+      } else {
+        await dumpAST(apps, logger.info.bind(logger))
+      }
+      setExitCode(ErrorCode.normal)
       return null
+    } finally {
+      // Batch callers may export several files through the same Config singleton.
+      // Keep this file's fallback separate from the caller's language settings.
+      if (inferredLanguage) Config.language = languageBeforeInference
     }
-    // read and parse the source file(s)
-    const apps = loadSource(Config.maindir)
-    // logger.info("apps: " + JSON.stringify(apps));
-    if (apps.length === 0) {
-      const ecode = ErrorCode.no_valid_source_file
-      handleException(null, `ERROR: ${ErrorCode.toString(ecode)}`, `ERROR: ${ErrorCode.toString(ecode)}`)
-      process.exitCode = ecode
-      return
-    }
-    if (Config.ASTFileOutput) {
-      await dumpAST(apps, fs.writeFileSync)
-    } else {
-      await dumpAST(apps, logger.info.bind(logger))
-    }
-    setExitCode(ErrorCode.normal)
-    return null
   }
 
   // dump all AST
@@ -850,18 +876,6 @@ async function initAnalyzer(dir: any, args: any[] = [], printf?: any) {
     CAnalyzer,
     CppAnalyzer,
   }
-  const analyzerLanguage = {
-    EggAnalyzer: 'javascript',
-    JavaScriptAnalyzer: 'javascript',
-    JavaAnalyzer: 'java',
-    SpringAnalyzer: 'java',
-    GoAnalyzer: 'golang',
-    PythonAnalyzer: 'python',
-    PhpAnalyzer: 'php',
-    CAnalyzer: 'c',
-    CppAnalyzer: 'cpp',
-  }
-
   let Analyzer: any
   if (Config.analyzer && Config.analyzer !== '') {
     Analyzer = (analyzerEnum as any)[Config.analyzer]
