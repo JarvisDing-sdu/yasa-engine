@@ -603,7 +603,9 @@ function getAllEntryPointsUsingCallGraph(callGraph: any, analyzer?: any): any[] 
           targetNodeFuncDef?.loc?.end?.line &&
           targetNodeFuncDef?.loc?.sourcefile === thisNodeFuncDef?.loc?.sourcefile &&
           targetNodeFuncDef?.loc?.start?.line === thisNodeFuncDef?.loc?.start?.line &&
-          targetNodeFuncDef?.loc?.end?.line === thisNodeFuncDef?.loc?.end?.line
+          targetNodeFuncDef?.loc?.end?.line === thisNodeFuncDef?.loc?.end?.line &&
+          targetNodeFuncDef?.loc?.start?.column === thisNodeFuncDef?.loc?.start?.column &&
+          targetNodeFuncDef?.loc?.end?.column === thisNodeFuncDef?.loc?.end?.column
         ) {
           hasCalled = true
           break
@@ -860,7 +862,10 @@ function getFclosEntryPointsUsingCallGraphByTargetNode(
         targetNodeAST.loc?.end?.line &&
         targetNodeAST.loc?.sourcefile === thisNodeAST.loc?.sourcefile &&
         targetNodeAST.loc?.start?.line === thisNodeAST.loc?.start?.line &&
-        targetNodeAST.loc?.end?.line === thisNodeAST.loc?.end?.line
+        targetNodeAST.loc?.end?.line === thisNodeAST.loc?.end?.line &&
+        // Distinct function definitions can occupy the same source line.
+        targetNodeAST.loc?.start?.column === thisNodeAST.loc?.start?.column &&
+        targetNodeAST.loc?.end?.column === thisNodeAST.loc?.end?.column
       ) {
         targetNodes.push(callGraph.edges.get(ek)?.sourceNodeId)
         hasFind = true

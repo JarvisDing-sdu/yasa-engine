@@ -39,12 +39,45 @@ function namespaces(context: string): string[] {
 }
 
 /**
+ * Expand a using entry in its declaring namespace's lookup order.
+ * @param entry - Namespace import
+ * @param name - Referenced member name
+ * @returns {string[]} Canonical candidate names
+ */
+function usingCandidates(entry: UsingEntry, name: string): string[] {
+  const target = entry.usingNamespace ? `${entry.usingNamespace}::${name}` : entry.usingDeclaration
+  if (!target?.endsWith(`::${name}`)) return []
+  const contexts = target.startsWith('::') ? [''] : namespaces(entry.context)
+  return contexts.map((ns) => (ns ? `${ns}::${target}` : target).replace(/^::/, ''))
+}
+
+/**
+ * Preserve the import's declaration position and optional block extent.
+ * @param node - Using-declaration UAST node
+ * @param extent - Enclosing function or block location
+ * @param depth - Lexical block depth
+ * @returns {UsingEntry} Import lookup information
+ */
+function usingEntry(node: any, extent: any, depth: number): UsingEntry {
+  const meta = node._meta
+  return {
+    usingNamespace: meta.usingNamespace,
+    usingDeclaration: meta.usingDeclaration,
+    context: meta.namespaceContext ?? '',
+    position: coordinate(node.loc?.start),
+    depth,
+    ...(extent ? { start: coordinate(extent.start), end: coordinate(extent.end) } : {}),
+  }
+}
+
+/**
  * Collect using declarations with their lexical extent and point of declaration.
  * @param ast - Compile-unit UAST
- * @returns {UsingEntry[]} Resolved analysis value.
+ * @returns {{usings: UsingEntry[], prototypes: Set<string>}} Namespace lookup information
  */
-function collectUsings(ast: any): UsingEntry[] {
+function collectNamespaceEntries(ast: any): { usings: UsingEntry[]; prototypes: Set<string> } {
   const result: UsingEntry[] = []
+  const prototypes = new Set<string>()
   const seen = new Set<any>()
   const walk = (node: any, extent: any, depth: number): void => {
     if (!node || typeof node !== 'object' || seen.has(node)) return
@@ -53,26 +86,20 @@ function collectUsings(ast: any): UsingEntry[] {
       for (const item of node) walk(item, extent, depth)
       return
     }
-    if (node.type === 'FunctionDefinition' || node.type === 'ScopedStatement') {
+    if (['FunctionDefinition', 'ScopedStatement'].includes(node.type)) {
       extent = node.loc
       depth++
     }
-    const m = node._meta
-    if (node.type === 'Noop' && (m?.usingNamespace || m?.usingDeclaration)) {
-      result.push({
-        usingNamespace: m.usingNamespace,
-        usingDeclaration: m.usingDeclaration,
-        context: m.namespaceContext ?? '',
-        position: coordinate(node.loc?.start),
-        depth,
-        ...(extent ? { start: coordinate(extent.start), end: coordinate(extent.end) } : {}),
-      })
+    const m = node._meta || {}
+    if (m.prototype) prototypes.add(m.qualifiedName || m.prototype)
+    if (node.type === 'Noop' && (m.usingNamespace || m.usingDeclaration)) {
+      result.push(usingEntry(node, extent, depth))
     }
     for (const [key, value] of Object.entries(node))
       if (!['loc', 'parent', '_meta'].includes(key)) walk(value, extent, depth)
   }
   walk(ast, undefined, 0)
-  return result
+  return { usings: result, prototypes }
 }
 
 /** Namespace lookup is shared by reads and writes; qualified aliases never copy variable values. */
@@ -82,6 +109,8 @@ class CppAnalyzer extends CAnalyzer {
   private namespaceScopes = new WeakMap<object, Map<string, any>>()
 
   private usings = new Map<string, UsingEntry[]>()
+
+  private prototypes = new Map<string, Set<string>>()
 
   private lexicalBlocks: { parent: any; loc: any }[] = []
 
@@ -110,7 +139,11 @@ class CppAnalyzer extends CAnalyzer {
    * @returns {any} Resolved analysis value.
    */
   override processModule(ast: any, filename: any) {
-    if (ast && !this.usings.has(filename)) this.usings.set(filename, collectUsings(ast))
+    if (ast && !this.usings.has(filename)) {
+      const entries = collectNamespaceEntries(ast)
+      this.usings.set(filename, entries.usings)
+      this.prototypes.set(filename, entries.prototypes)
+    }
     return super.processModule(ast, filename)
   }
 
@@ -299,12 +332,7 @@ class CppAnalyzer extends CAnalyzer {
    */
   private usingBinding(mod: any, name: string, entries: UsingEntry[], namespaceAt?: string): Binding | undefined {
     for (const e of entries) {
-      let target: string | undefined
-      if (e.usingNamespace) target = `${e.usingNamespace}::${name}`
-      else if (e.usingDeclaration?.endsWith(`::${name}`)) target = e.usingDeclaration
-      if (!target) continue
-      for (const ns of target.startsWith('::') ? [''] : namespaces(e.context)) {
-        const key = (ns ? `${ns}::${target}` : target).replace(/^::/, '')
+      for (const key of usingCandidates(e, name)) {
         const binding = this.qualifiedBinding(mod, key)
         if (binding) {
           if (e.usingNamespace && namespaceAt !== undefined) {
@@ -340,6 +368,47 @@ class CppAnalyzer extends CAnalyzer {
   }
 
   /**
+   * Resolve namespace members introduced by namespace-scope using declarations
+   * and directives. Qualified lookup also follows those imports outside the
+   * importing namespace. Block-local imports never become namespace members.
+   * @param mod - Owning compile-unit scope
+   * @param key - Qualified member name
+   * @param entries - Namespace imports declared before the reference
+   * @param prototypes - Qualified declarations in this compile unit
+   * @param seen - Names already visited in this lookup
+   * @returns {Binding|undefined} The canonical binding, when found
+   */
+  private namespaceMemberBinding(
+    mod: any,
+    key: string,
+    entries: UsingEntry[],
+    prototypes: Set<string>,
+    seen = new Set<string>()
+  ): Binding | undefined {
+    const direct = this.qualifiedBinding(mod, key)
+    if (direct || seen.has(key)) return direct
+    seen.add(key)
+    if (prototypes.has(key)) {
+      return { scope: this.topScope, name: key.startsWith('std::') ? key.slice(5) : key }
+    }
+    const separator = key.lastIndexOf('::')
+    if (separator < 0) return undefined
+    const context = key.slice(0, separator)
+    const name = key.slice(separator + 2)
+    const imports = entries.filter((entry) => entry.context === context)
+    const candidates = imports.flatMap((entry) => usingCandidates(entry, name))
+    for (const candidate of candidates) {
+      const found = this.namespaceMemberBinding(mod, candidate, entries, prototypes, seen)
+      if (found) return found
+    }
+    // External declarations can refer to functions represented by library models.
+    const imported = imports.find((entry) => entry.usingDeclaration?.endsWith(`::${name}`))
+    if (!imported) return undefined
+    const canonical = imported.usingDeclaration!.replace(/^::/, '')
+    return { scope: this.topScope, name: canonical.startsWith('std::') ? name : canonical }
+  }
+
+  /**
    * Resolve absolute or relative qualified identifiers.
    * @param mod - Owning compile-unit scope
    * @param node - UAST node
@@ -348,8 +417,12 @@ class CppAnalyzer extends CAnalyzer {
   private resolveQualified(mod: any, node: any): Binding | undefined {
     const meta = node._meta || {}
     const key = meta.qualifier ? `${meta.qualifier}::${node.name}` : node.name
+    const entries = (this.usings.get(String(node.loc?.sourcefile ?? '')) || []).filter(
+      (entry) => entry.start === undefined && entry.position <= coordinate(node.loc?.start)
+    )
+    const prototypes = this.prototypes.get(String(node.loc?.sourcefile ?? '')) || new Set<string>()
     for (const ns of meta.globalQualified || meta.qualifier === '' ? [''] : namespaces(meta.namespaceContext ?? '')) {
-      const found = this.qualifiedBinding(mod, ns ? `${ns}::${key}` : key)
+      const found = this.namespaceMemberBinding(mod, ns ? `${ns}::${key}` : key, entries, prototypes)
       if (found) return found
     }
     // std C wrappers and global libc names use C's existing library models. Other unresolved qualifiers stay qualified.
@@ -430,7 +503,7 @@ class CppAnalyzer extends CAnalyzer {
    */
   override processCallExpression(scope: any, node: any, state: any): any {
     const binding = this.resolveBinding(scope, node.callee)
-    if (binding?.name.includes('::') && !binding.name.startsWith('std::')) {
+    if (binding && (node.callee._meta?.qualifier !== undefined || binding.name.includes('::'))) {
       // C's numeric/library models use the callee name. Preserve the resolved namespace
       // through that layer so a user's atoi/strcpy/etc keeps its own function semantics.
       node = {

@@ -124,7 +124,7 @@
     "test-entrypoint-deadline-budget": "npx mocha --require tsx/cjs test/entrypoint-deadline-budget.test.ts",
     "test-entrypoint-deadline-scheduler": "npx mocha --require tsx/cjs test/entrypoint-deadline-scheduler.test.ts",
     "test-c": "npx mocha --require tsx/cjs test/c/test-c-checker.ts test/c/test-c-semantics.ts test/c/test-c-worker-config.ts test/c/test-c-callgraph.ts",
-    "test-cpp": "npx mocha --require tsx/cjs test/cpp/test-cpp.ts test/cpp/test-review-regressions.ts"
+    "test-cpp": "npx mocha --require tsx/cjs test/cpp/test-cpp.ts test/cpp/test-review-regressions.ts test/cpp/test-library-aliases.ts test/c-family/test-language-selection.ts"
   },
   "install": "npm install",
   "files": [
