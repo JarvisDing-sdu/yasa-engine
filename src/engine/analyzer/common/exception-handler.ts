@@ -22,6 +22,14 @@ function clearErrorStats(): void {
 }
 
 let totalErrors: any[]
+
+/**
+ * Read accumulated execution failures without mutating existing handler behavior.
+ * @returns {number} Failures recorded since the last reset.
+ */
+function getTotalErrorCount(): number {
+  return totalErrors?.length || 0
+}
 /**
  *
  * @param {Error} error
@@ -74,4 +82,5 @@ export {
   outputTotalErrorsExceptionHandler as outputTotalErrors,
   incrementErrorStat,
   getErrorStats,
+  getTotalErrorCount,
 }
