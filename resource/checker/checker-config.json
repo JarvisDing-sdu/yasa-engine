@@ -252,9 +252,9 @@
     "description": "PHP callchain checker，只检测sink匹配并输出调用链路",
     "demoRuleConfigPath": "resource/example-rule-config/rule_config_php.json"
   },
-{
-  "checkerId": "taint_flow_c_cpp_input",
-  "checkerPath": "checker/taint/c-family/c-family-default-taint-checker.ts",
-  "description": "C/C++ 编译目标内污点追踪"
-}
+  {
+    "checkerId": "taint_flow_c_cpp_input",
+    "checkerPath": "checker/taint/c-family/c-family-default-taint-checker.ts",
+    "description": "C/C++ 编译目标内污点追踪"
+  }
 ]
