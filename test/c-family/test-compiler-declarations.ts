@@ -339,6 +339,43 @@ describe('streaming compiler declarations', () => {
     assert.deepStrictEqual(metadata.references, [{ offset: 0, end: 3, declarationId: 'global', name: 'global' }])
   })
 
+  it('flags unsupported global initializer expressions without flagging local code or class declarations', async () => {
+    const construct = (offset: number) => ({
+      kind: 'CXXConstructExpr',
+      loc: { offset },
+      type: { qualType: 'NeedsRuntimeConstruction' },
+    })
+    const initialized = (id: string, offset: number) => variable(id, offset, {
+      init: 'call',
+      inner: [{ kind: 'ExprWithCleanups', inner: [construct(offset)] }],
+    })
+    const metadata = await read(translationUnit([
+      initialized('global', 10),
+      {
+        kind: 'FunctionDecl',
+        id: 'function',
+        inner: [initialized('local', 20)],
+      },
+      {
+        kind: 'CXXRecordDecl',
+        name: 'Unused',
+        inner: [
+          { kind: 'CXXConstructorDecl', loc: { offset: 30 } },
+          { kind: 'CXXMethodDecl', loc: { offset: 40 }, inner: [initialized('methodLocal', 50)] },
+        ],
+      },
+      variable('withoutInitializer', 60, { inner: [construct(60)] }),
+    ]))
+    assert.deepStrictEqual(metadata.unsupported, [
+      { kind: 'CXXConstructExpr', offset: 10, type: 'NeedsRuntimeConstruction', globalInitializer: true },
+      { kind: 'CXXConstructExpr', offset: 20, type: 'NeedsRuntimeConstruction' },
+      { kind: 'CXXConstructorDecl', offset: 30 },
+      { kind: 'CXXConstructExpr', offset: 50, type: 'NeedsRuntimeConstruction' },
+      { kind: 'CXXMethodDecl', offset: 40 },
+      { kind: 'CXXConstructExpr', offset: 60, type: 'NeedsRuntimeConstruction' },
+    ])
+  })
+
   it('rejects malformed, truncated, multiple-root and unexpected-root JSON', async () => {
     const valid = JSON.stringify(translationUnit([variable('present', 0)]))
     for (const content of [

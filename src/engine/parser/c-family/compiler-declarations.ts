@@ -1,5 +1,6 @@
 import { createReadStream } from 'fs'
 import { TextDecoder } from 'util'
+import { createRequire } from 'module'
 
 export interface CompilerDeclaration {
   id: string
@@ -17,6 +18,7 @@ export interface CompilerDeclaration {
   scopeNames: string[]
   languageLinkage: 'C' | 'C++'
   hasBody: boolean
+  template?: boolean
 }
 
 export interface CompilerReference {
@@ -29,7 +31,7 @@ export interface CompilerReference {
 export interface CompilerMetadata {
   declarations: CompilerDeclaration[]
   references: CompilerReference[]
-  unsupported: { kind: string; offset: number }[]
+  unsupported: { kind: string; offset: number; type?: string; globalInitializer?: boolean }[]
 }
 
 interface Location {
@@ -42,11 +44,14 @@ interface AstNode {
   name?: string
   loc?: Location
   range?: { begin?: Location; end?: Location }
-  type?: { qualType?: string }
+  type?: { qualType?: string; desugaredQualType?: string }
+  isImplicit?: boolean
+  definitionData?: { isTrivial?: boolean }
   mangledName?: string
   previousDecl?: string
   storageClass?: string
   inline?: boolean
+  init?: string
   language?: string
   referencedDecl?: { id?: string; name?: string }
 }
@@ -61,8 +66,8 @@ interface JsonParser {
   write: (buffer: Buffer) => void
 }
 
-// jsonparse 1.3.1 has no bundled TypeScript declarations.
-const JsonParse = require('jsonparse') as {
+// Load the untyped CommonJS parser through Node's module API.
+const JsonParse = createRequire(__filename)('jsonparse') as {
   new (): JsonParser
   C: Record<string, number>
 }
@@ -71,6 +76,11 @@ const unsupportedKinds = new Set([
   'CXXMethodDecl',
   'CXXConstructorDecl',
   'CXXMemberCallExpr',
+  'CXXOperatorCallExpr',
+  'CXXConstructExpr',
+  'CXXTemporaryObjectExpr',
+  'CXXDynamicCastExpr',
+  'CXXThrowExpr',
   'LambdaExpr',
   'FunctionTemplateDecl',
   'ClassTemplateDecl',
@@ -79,12 +89,20 @@ const unsupportedKinds = new Set([
   'CXXTryStmt',
 ])
 
-/** Accept raw byte offsets only; presumed lines and macro locations are not offsets. */
+/**
+ * Accept raw byte offsets only; presumed lines and macro locations are not offsets.
+ * @param value Raw offset or token length from the compiler AST.
+ * @returns {boolean} Whether the value is a nonnegative safe integer.
+ */
 function isOffset(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
 }
 
-/** Convert Clang's inclusive final token to an exclusive byte end. */
+/**
+ * Convert Clang's inclusive final token to an exclusive byte end.
+ * @param range Raw compiler range with inclusive final-token coordinates.
+ * @returns {object|undefined} Validated byte range with an exclusive end, if available.
+ */
 function byteRange(range: AstNode['range']): CompilerDeclaration['range'] | undefined {
   const begin = range?.begin?.offset
   const end = range?.end?.offset
@@ -94,57 +112,320 @@ function byteRange(range: AstNode['range']): CompilerDeclaration['range'] | unde
   return { begin, end: end + length }
 }
 
+interface JsonLexemes {
+  quoted: boolean
+  escaped: boolean
+  unicodeDigits: number
+  number: string
+}
+
+interface AstReaderState {
+  metadata: CompilerMetadata
+  bodies: WeakMap<AstNode, { range?: CompilerDeclaration['range'] }>
+  trivialTypes: Set<string>
+  rootComplete: boolean
+}
+
+interface DeclarationScope {
+  scopeNames: string[]
+  languageLinkage: CompilerDeclaration['languageLinkage']
+  functionId?: string
+}
+
+type LocatedDeclaration = AstNode & {
+  id: string
+  kind: CompilerDeclaration['kind']
+  loc: Location & { offset: number }
+}
+
+const validNumber = /^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$/
+
 /**
- * Read a Clang JSON AST, retaining metadata and the active ancestry only.
- * Offsets refer to the preprocessed input; origin and redeclaration resolution
- * belong to the caller. Results follow completion order, not declaration order.
+ * Recognize ASCII decimal digits without decoding the complete input stream.
+ * @param byte Input byte to classify.
+ * @returns {boolean} Whether the byte represents an ASCII decimal digit.
  */
-export async function readCompilerDeclarations(file: string): Promise<CompilerMetadata> {
-  const metadata: CompilerMetadata = { declarations: [], references: [], unsupported: [] }
-  const bodies = new WeakMap<AstNode, { range?: CompilerDeclaration['range'] }>()
+function isDecimalByte(byte: number): boolean {
+  return byte >= 48 && byte <= 57
+}
+
+/**
+ * Recognize the exact hexadecimal alphabet accepted in JSON Unicode escapes.
+ * @param byte Input byte to classify.
+ * @returns {boolean} Whether the byte is an ASCII hexadecimal digit.
+ */
+function isHexByte(byte: number): boolean {
+  return isDecimalByte(byte) || (byte >= 65 && byte <= 70) || (byte >= 97 && byte <= 102)
+}
+
+/**
+ * Track string escapes across chunks and reject jsonparse's extra Unicode digits.
+ * @param lexemes Mutable lexical state carried across stream chunks.
+ * @param byte Next byte inside a quoted JSON string.
+ */
+function validateStringByte(lexemes: JsonLexemes, byte: number): void {
+  if (lexemes.unicodeDigits > 0) {
+    if (!isHexByte(byte)) throw new Error('Invalid JSON Unicode escape')
+    lexemes.unicodeDigits--
+  } else if (lexemes.escaped) {
+    if (byte === 117) lexemes.unicodeDigits = 4
+    lexemes.escaped = false
+  } else if (byte === 92) lexemes.escaped = true
+  else if (byte === 34) lexemes.quoted = false
+}
+
+/**
+ * Validate numeric lexemes before jsonparse can coerce invalid numbers to strings.
+ * @param lexemes Mutable lexical state carried across stream chunks.
+ * @param byte Next byte outside a quoted JSON string.
+ */
+function validateUnquotedByte(lexemes: JsonLexemes, byte: number): void {
+  const numeric = isDecimalByte(byte) || byte === 45 || byte === 43 || byte === 46 || byte === 69 || byte === 101
+  if (lexemes.number && !numeric) {
+    if (!validNumber.test(lexemes.number)) throw new Error('Invalid JSON number')
+    lexemes.number = ''
+  }
+  if (numeric && (lexemes.number || byte === 45 || isDecimalByte(byte))) lexemes.number += String.fromCharCode(byte)
+  if (byte === 34) lexemes.quoted = true
+}
+
+/**
+ * Validate lexemes without retaining chunks or changing the parser's byte input.
+ * @param lexemes Mutable lexical state carried across stream chunks.
+ * @param chunk Raw bytes that will subsequently be written to jsonparse.
+ */
+function validateChunk(lexemes: JsonLexemes, chunk: Buffer): void {
+  for (const byte of chunk) {
+    if (lexemes.quoted) validateStringByte(lexemes, byte)
+    else validateUnquotedByte(lexemes, byte)
+  }
+}
+
+/**
+ * Check for a non-array AST object without treating scalar inner values as nodes.
+ * @param value Completed JSON value supplied by jsonparse.
+ * @returns {boolean} Whether the value can represent a compiler AST node.
+ */
+function isAstNode(value: unknown): value is AstNode {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+}
+
+/**
+ * Require an explicit translation-unit kind on the completed root object.
+ * @param value Completed root value supplied by jsonparse.
+ */
+function validateRoot(value: unknown): void {
+  if (!isAstNode(value) || !Object.prototype.hasOwnProperty.call(value, 'kind') || value.kind !== 'TranslationUnitDecl')
+    throw new Error('Expected TranslationUnitDecl JSON root')
+}
+
+/**
+ * Preserve named and anonymous namespaces, lexical linkage, and the nearest function.
+ * @param stack Active parser ancestry before the completed node is freed.
+ * @returns {DeclarationScope} Lexical metadata inherited by the completed declaration.
+ */
+function declarationScope(stack: JsonParser['stack']): DeclarationScope {
+  const scope: DeclarationScope = { scopeNames: [], languageLinkage: 'C++' }
+  for (const frame of stack) {
+    if (frame.key !== 'inner' || !frame.value) continue
+    const ancestor = frame.value
+    if (ancestor.kind === 'NamespaceDecl') scope.scopeNames.push(ancestor.name || '')
+    if (ancestor.kind === 'LinkageSpecDecl' && (ancestor.language === 'C' || ancestor.language === 'C++'))
+      scope.languageLinkage = ancestor.language
+    if (ancestor.kind === 'FunctionDecl') scope.functionId = ancestor.id
+  }
+  return scope
+}
+
+/**
+ * Record trivial record types so their construction expressions can be filtered later.
+ * @param node Completed AST node, including implicit record declarations.
+ * @param stack Active parser ancestry used to qualify the record name.
+ * @param trivialTypes Set of qualified trivial record names collected so far.
+ */
+function collectTrivialType(node: AstNode, stack: JsonParser['stack'], trivialTypes: Set<string>): void {
+  if (node.kind !== 'CXXRecordDecl' || !node.definitionData?.isTrivial || !node.name) return
+  const namespace = stack
+    .filter((frame) => frame.key === 'inner' && frame.value?.kind === 'NamespaceDecl')
+    .map((frame) => frame.value!.name || '')
+  trivialTypes.add([...namespace, node.name].join('::'))
+}
+
+/**
+ * Identify runtime initializer expressions outside functions, methods, and constructors.
+ * @param node Completed unsupported node, which must be an expression rather than a declaration.
+ * @param stack Active ancestry carrying the enclosing variable's initializer metadata.
+ * @returns {boolean} Whether the expression belongs to a file-scope variable initializer.
+ */
+function isGlobalInitializer(node: AstNode, stack: JsonParser['stack']): boolean {
+  if (!node.kind?.endsWith('Expr')) return false
+  let initializer = false
+  for (const frame of stack) {
+    if (frame.key !== 'inner' || !frame.value) continue
+    const ancestor = frame.value
+    if (
+      ['FunctionDecl', 'CXXMethodDecl', 'CXXConstructorDecl', 'CXXDestructorDecl', 'CXXConversionDecl'].includes(
+        ancestor.kind || ''
+      )
+    )
+      return false
+    if (ancestor.kind === 'VarDecl' && ancestor.init) initializer = true
+  }
+  return initializer
+}
+
+/**
+ * Record unsupported explicit syntax with raw offsets and constructor type evidence.
+ * @param node Completed AST node to classify.
+ * @param stack Active ancestry used to distinguish global initializers from local code.
+ * @param metadata Output metadata receiving unsupported syntax diagnostics.
+ */
+function collectUnsupported(node: AstNode, stack: JsonParser['stack'], metadata: CompilerMetadata): void {
+  if (node.isImplicit || !node.kind || !unsupportedKinds.has(node.kind)) return
+  const offset = node.loc?.offset ?? node.range?.begin?.offset
+  if (!isOffset(offset)) return
+  const unsupported: CompilerMetadata['unsupported'][number] = { kind: node.kind, offset }
+  if (node.kind === 'CXXConstructExpr') unsupported.type = node.type?.desugaredQualType || node.type?.qualType
+  if (isGlobalInitializer(node, stack)) unsupported.globalInitializer = true
+  metadata.unsupported.push(unsupported)
+}
+
+/**
+ * Record complete declaration references without traversing their embedded declarations.
+ * @param node Completed AST node to inspect.
+ * @param range Validated byte range of the node, if available.
+ * @param metadata Output metadata receiving reference records.
+ */
+function collectReference(
+  node: AstNode,
+  range: CompilerDeclaration['range'] | undefined,
+  metadata: CompilerMetadata
+): void {
+  if (
+    node.kind === 'DeclRefExpr' &&
+    range &&
+    typeof node.referencedDecl?.id === 'string' &&
+    typeof node.referencedDecl.name === 'string'
+  ) {
+    metadata.references.push({
+      offset: range.begin,
+      end: range.end,
+      declarationId: node.referencedDecl.id,
+      name: node.referencedDecl.name,
+    })
+  }
+}
+
+/**
+ * Require an explicit supported declaration kind with a stable ID and raw location.
+ * @param node Completed AST node to inspect.
+ * @returns {boolean} Whether the node has the mandatory declaration fields.
+ */
+function isLocatedDeclaration(node: AstNode): node is LocatedDeclaration {
+  return (
+    !node.isImplicit &&
+    (node.kind === 'FunctionDecl' || node.kind === 'VarDecl' || node.kind === 'ParmVarDecl') &&
+    typeof node.id === 'string' &&
+    isOffset(node.loc?.offset)
+  )
+}
+
+/**
+ * Copy optional declaration fields while preserving the distinction between absent and false.
+ * @param declaration Metadata record receiving the optional fields.
+ * @param node Original completed declaration node.
+ * @param functionId Nearest owning function, if one was found in the ancestry.
+ * @param body Direct function body evidence, including bodies without valid ranges.
+ */
+function copyDeclarationDetails(
+  declaration: CompilerDeclaration,
+  node: AstNode,
+  functionId: string | undefined,
+  body: { range?: CompilerDeclaration['range'] } | undefined
+): void {
+  if (node.mangledName !== undefined) declaration.mangledName = node.mangledName
+  if (node.previousDecl !== undefined) declaration.previousDecl = node.previousDecl
+  if (node.storageClass !== undefined) declaration.storage = node.storageClass
+  if (node.inline !== undefined) declaration.inline = node.inline
+  if (node.kind !== 'FunctionDecl' && functionId !== undefined) declaration.functionId = functionId
+  if (body?.range) declaration.bodyRange = body.range
+}
+
+/**
+ * Build declaration metadata after its children have supplied body and scope evidence.
+ * @param node Completed AST node to classify.
+ * @param range Validated byte range of the node, if available.
+ * @param stack Active parser ancestry used for lexical ownership and template status.
+ * @param state Accumulated metadata and weakly held direct-body evidence.
+ */
+function collectDeclaration(
+  node: AstNode,
+  range: CompilerDeclaration['range'] | undefined,
+  stack: JsonParser['stack'],
+  state: AstReaderState
+): void {
+  if (!isLocatedDeclaration(node) || !range) return
+  const scope = declarationScope(stack)
+  if (node.kind === 'ParmVarDecl' && scope.functionId === undefined) return
+  const name = node.name ?? ''
+  if (
+    node.kind === 'FunctionDecl' &&
+    node.mangledName !== undefined &&
+    (node.mangledName === name || node.mangledName === `_${name}`)
+  )
+    scope.languageLinkage = 'C'
+  const body = node.kind === 'FunctionDecl' ? state.bodies.get(node) : undefined
+  const declaration: CompilerDeclaration = {
+    id: node.id,
+    kind: node.kind,
+    name,
+    offset: node.loc.offset,
+    range,
+    type: node.type?.qualType ?? '',
+    scopeNames: scope.scopeNames,
+    languageLinkage: scope.languageLinkage,
+    hasBody: body !== undefined,
+  }
+  if (stack.some((frame) => frame.key === 'inner' && frame.value?.kind === 'FunctionTemplateDecl'))
+    declaration.template = true
+  copyDeclarationDetails(declaration, node, scope.functionId, body)
+  state.metadata.declarations.push(declaration)
+}
+
+/**
+ * Collect one completed inner node before its parent array releases it.
+ * @param node Completed AST node with ordinary properties still intact.
+ * @param parent Direct AST parent from the inner-array frame.
+ * @param stack Active parser ancestry used for namespace and function ownership.
+ * @param state Accumulated metadata and weakly held body evidence.
+ */
+function collectNode(
+  node: AstNode,
+  parent: AstNode | undefined,
+  stack: JsonParser['stack'],
+  state: AstReaderState
+): void {
+  const range = byteRange(node.range)
+  if (node.kind === 'CompoundStmt' && parent?.kind === 'FunctionDecl') state.bodies.set(parent, { range })
+  collectTrivialType(node, stack, state.trivialTypes)
+  collectUnsupported(node, stack, state.metadata)
+  collectReference(node, range, state.metadata)
+  collectDeclaration(node, range, stack, state)
+}
+
+/**
+ * Configure strict root/token handling and metadata extraction on the streaming parser.
+ * @param state Accumulated reader state updated as nodes and the root complete.
+ * @returns {JsonParser} Parser that frees every completed AST inner-array element.
+ */
+function createAstParser(state: AstReaderState): JsonParser {
   const parser = new JsonParse()
   const tokens = JsonParse.C
-  const onToken = parser.onToken
-  const utf8 = new TextDecoder('utf-8', { fatal: true })
+  const { onToken } = parser
   let previousToken: number | undefined
-  let rootComplete = false
-  let quoted = false
-  let escaped = false
-  let unicodeDigits = 0
-  let number = ''
-  const validNumber = /^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$/
-
-  // The tokenizer also coerces leading-zero numbers into strings and accepts
-  // punctuation as Unicode hex digits. Validate those lexemes across chunks.
-  const validateChunk = (chunk: Buffer) => {
-    for (const byte of chunk) {
-      if (quoted) {
-        if (unicodeDigits > 0) {
-          if (!((byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 70) || (byte >= 97 && byte <= 102)))
-            throw new Error('Invalid JSON Unicode escape')
-          unicodeDigits--
-        } else if (escaped) {
-          if (byte === 117) unicodeDigits = 4
-          escaped = false
-        } else if (byte === 92) escaped = true
-        else if (byte === 34) quoted = false
-      } else {
-        const numeric =
-          (byte >= 48 && byte <= 57) || byte === 45 || byte === 43 || byte === 46 || byte === 69 || byte === 101
-        if (number && !numeric) {
-          if (!validNumber.test(number)) throw new Error('Invalid JSON number')
-          number = ''
-        }
-        if (numeric && (number || byte === 45 || (byte >= 48 && byte <= 57))) number += String.fromCharCode(byte)
-        if (byte === 34) quoted = true
-      }
-    }
-  }
-
-  // jsonparse intentionally accepts streams of roots and some non-JSON syntax.
-  // Keep its tokenizer/tree builder, but reject those extensions for AST files.
-  parser.onToken = function (token, value) {
-    if (rootComplete) throw new Error('Unexpected JSON after AST root')
+  // jsonparse accepts streams of roots and some non-JSON syntax; AST files do not.
+  parser.onToken = function validateAstToken(token, value) {
+    if (state.rootComplete) throw new Error('Unexpected JSON after AST root')
     if (previousToken === undefined && token !== tokens.LEFT_BRACE)
       throw new Error('Expected TranslationUnitDecl JSON root')
     if (
@@ -155,110 +436,58 @@ export async function readCompilerDeclarations(file: string): Promise<CompilerMe
     previousToken = token
     onToken.call(this, token, value)
   }
-
-  parser.onValue = function (value) {
+  parser.onValue = function collectAstValue(value) {
     if (this.stack.length === 0) {
-      if (
-        !value ||
-        typeof value !== 'object' ||
-        Array.isArray(value) ||
-        !Object.prototype.hasOwnProperty.call(value, 'kind') ||
-        (value as AstNode).kind !== 'TranslationUnitDecl'
-      )
-        throw new Error('Expected TranslationUnitDecl JSON root')
-      rootComplete = true
+      validateRoot(value)
+      state.rootComplete = true
       return
     }
     // referencedDecl/type/range objects can contain kinds too. Only objects
     // completed as elements of an AST inner array are actual traversed nodes.
     const parent = this.stack[this.stack.length - 1]
     if (typeof this.key !== 'number' || parent.key !== 'inner') return
-    if (value && typeof value === 'object' && !Array.isArray(value)) {
-      const node = value as AstNode
-      const range = byteRange(node.range)
-      if (node.kind === 'CompoundStmt' && parent.value?.kind === 'FunctionDecl') bodies.set(parent.value, { range })
-
-      if (node.kind && unsupportedKinds.has(node.kind)) {
-        const offset = node.loc?.offset ?? node.range?.begin?.offset
-        if (isOffset(offset)) metadata.unsupported.push({ kind: node.kind, offset })
-      }
-      if (
-        node.kind === 'DeclRefExpr' &&
-        range &&
-        typeof node.referencedDecl?.id === 'string' &&
-        typeof node.referencedDecl.name === 'string'
-      ) {
-        metadata.references.push({
-          offset: range.begin,
-          end: range.end,
-          declarationId: node.referencedDecl.id,
-          name: node.referencedDecl.name,
-        })
-      }
-      if (
-        (node.kind === 'FunctionDecl' || node.kind === 'VarDecl' || node.kind === 'ParmVarDecl') &&
-        typeof node.id === 'string' &&
-        isOffset(node.loc?.offset) &&
-        range
-      ) {
-        const scopeNames: string[] = []
-        let languageLinkage: CompilerDeclaration['languageLinkage'] = 'C++'
-        let functionId: string | undefined
-        for (const frame of this.stack) {
-          if (frame.key !== 'inner' || !frame.value) continue
-          const ancestor = frame.value
-          if (ancestor.kind === 'NamespaceDecl' && ancestor.name) scopeNames.push(ancestor.name)
-          if (ancestor.kind === 'LinkageSpecDecl' && (ancestor.language === 'C' || ancestor.language === 'C++'))
-            languageLinkage = ancestor.language
-          if (ancestor.kind === 'FunctionDecl') functionId = ancestor.id
-        }
-        const name = node.name ?? ''
-        if (
-          node.kind === 'FunctionDecl' &&
-          node.mangledName !== undefined &&
-          (node.mangledName === name || node.mangledName === `_${name}`)
-        )
-          languageLinkage = 'C'
-        const body = node.kind === 'FunctionDecl' ? bodies.get(node) : undefined
-        const declaration: CompilerDeclaration = {
-          id: node.id,
-          kind: node.kind,
-          name,
-          offset: node.loc.offset,
-          range,
-          type: node.type?.qualType ?? '',
-          scopeNames,
-          languageLinkage,
-          hasBody: body !== undefined,
-        }
-        if (node.mangledName !== undefined) declaration.mangledName = node.mangledName
-        if (node.previousDecl !== undefined) declaration.previousDecl = node.previousDecl
-        if (node.storageClass !== undefined) declaration.storage = node.storageClass
-        if (node.inline !== undefined) declaration.inline = node.inline
-        if (node.kind !== 'FunctionDecl' && functionId !== undefined) declaration.functionId = functionId
-        if (body?.range) declaration.bodyRange = body.range
-        metadata.declarations.push(declaration)
-      }
-    }
+    if (isAstNode(value)) collectNode(value, parent.value, this.stack, state)
     // Never leave completed children reachable from an ancestor's inner array.
     // In particular, do not prune ordinary properties such as type and range.
     delete this.value[this.key]
   }
+  return parser
+}
 
+/**
+ * Read a Clang JSON AST, retaining metadata and the active ancestry only.
+ * Offsets refer to the preprocessed input; origin and redeclaration resolution
+ * belong to the caller. Results follow completion order, not declaration order.
+ * @param file Path to the compiler's UTF-8 JSON AST output.
+ * @returns {Promise<CompilerMetadata>} Declarations, references, and unsupported explicit syntax.
+ */
+export async function readCompilerDeclarations(file: string): Promise<CompilerMetadata> {
+  const state: AstReaderState = {
+    metadata: { declarations: [], references: [], unsupported: [] },
+    bodies: new WeakMap(),
+    trivialTypes: new Set(),
+    rootComplete: false,
+  }
+  const parser = createAstParser(state)
+  const utf8 = new TextDecoder('utf-8', { fatal: true })
+  const lexemes: JsonLexemes = { quoted: false, escaped: false, unicodeDigits: 0, number: '' }
   const stream = createReadStream(file)
   try {
     for await (const chunk of stream) {
       utf8.decode(chunk as Buffer, { stream: true })
-      validateChunk(chunk as Buffer)
+      validateChunk(lexemes, chunk as Buffer)
       parser.write(chunk as Buffer)
     }
     utf8.decode()
-    if (!rootComplete || parser.stack.length !== 0 || parser.tState !== tokens.START)
+    if (!state.rootComplete || parser.stack.length !== 0 || parser.tState !== JsonParse.C.START)
       throw new Error('Truncated or incomplete AST JSON')
   } catch (error) {
     throw new Error(`Cannot read compiler AST JSON ${file}: ${(error as Error).message}`)
   } finally {
     stream.destroy()
   }
-  return metadata
+  state.metadata.unsupported = state.metadata.unsupported.filter(
+    (item) => item.kind !== 'CXXConstructExpr' || !state.trivialTypes.has(item.type || '')
+  )
+  return state.metadata
 }

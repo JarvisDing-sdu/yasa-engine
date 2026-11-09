@@ -29,6 +29,7 @@
     "graphviz": "^0.0.9",
     "is-type-of": "^1.2.1",
     "jsonfile": "^5.0.0",
+    "jsonparse": "1.3.1",
     "JSONStream": "^1.3.5",
     "lodash": "^4.17.21",
     "log4js": "^6.3.0",
@@ -124,6 +125,7 @@
     "test-entrypoint-deadline-budget": "npx mocha --require tsx/cjs test/entrypoint-deadline-budget.test.ts",
     "test-entrypoint-deadline-scheduler": "npx mocha --require tsx/cjs test/entrypoint-deadline-scheduler.test.ts",
     "test-c": "npx mocha --require tsx/cjs test/c/test-c-checker.ts test/c/test-c-semantics.ts test/c/test-c-worker-config.ts test/c/test-c-callgraph.ts",
+    "test-c-family": "npx mocha --require tsx/cjs test/c-family/*.ts",
     "test-cpp": "npx mocha --require tsx/cjs test/cpp/test-cpp.ts test/cpp/test-review-regressions.ts test/cpp/test-library-aliases.ts test/c-family/test-language-selection.ts"
   },
   "install": "npm install",

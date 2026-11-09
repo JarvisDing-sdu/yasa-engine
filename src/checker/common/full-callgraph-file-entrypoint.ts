@@ -118,6 +118,10 @@ function restoreNodeFromReferences(node: any, astManager?: any, symbolTable?: an
  * @param analyzer
  */
 function makeFullCallGraph(analyzer: any): void {
+  if (typeof analyzer.prepareCfamilyCallGraph === 'function') {
+    analyzer.prepareCfamilyCallGraph()
+    return
+  }
   performanceTracker.start(`startAnalyze.makeFullCallGraph(BySymbolInterpret)`)
   config.loadDefaultRule = false
   config.loadExternalRule = false

@@ -45,6 +45,7 @@ const analyzerLanguage: Record<string, string> = {
   PhpAnalyzer: 'php',
   CAnalyzer: 'c',
   CppAnalyzer: 'cpp',
+  CFamilyAnalyzer: 'cpp',
 }
 
 type CallSummaryMode = (typeof CALL_SUMMARY_MODES)[number]
@@ -129,6 +130,17 @@ function isDataflowDbMode(mode: string): mode is DataflowDbMode {
  * @returns {Promise<any>} Analyzer results or undefined
  */
 async function execute(dir: any, args: any[] = [], printf?: any) {
+  let selectedLanguage: string | undefined
+  for (let index = 0; index < args.length && args[index] !== '--'; index++) {
+    if (args[index] === '--language') selectedLanguage = args[++index]
+    else if (typeof args[index] === 'string' && args[index].startsWith('--language=')) {
+      selectedLanguage = args[index].slice('--language='.length)
+    }
+  }
+  if (selectedLanguage === 'c-cpp') {
+    const { runCfamilyCLI } = require('./c-family-runner')
+    return runCfamilyCLI(dir, args)
+  }
   // 启动 banner：版本 / heap 限制 / 主入口，放在 Begin execution 之前
   yasaSeparator('Yet Another Static Analyzer (YASA)')
   const heapLimitMb = Math.round(v8.getHeapStatistics().heap_size_limit / 1024 / 1024)
@@ -332,7 +344,7 @@ async function initAnalyzer(dir: any, args: any[] = [], printf?: any) {
         setExitCode(ErrorCode.config_error)
       }
     })
-    .option('--language <lang>', '指定语言（支持: javascript/typescript/golang/python/java/php/c/cpp）', (lang: any) => {
+    .option('--language <lang>', '指定语言（支持: javascript/typescript/golang/python/java/php/c/cpp/c-cpp）', (lang: any) => {
       const supported = ['javascript', 'typescript', 'js', 'ts', 'go', 'golang', 'python', 'java', 'php', 'c', 'cpp']
       if (!supported.includes(lang)) {
         handleException(
@@ -865,6 +877,8 @@ async function initAnalyzer(dir: any, args: any[] = [], printf?: any) {
 
   const CppAnalyzer = require('../engine/analyzer/cpp/common/cpp-analyzer')
 
+  const CFamilyAnalyzer = require('../engine/analyzer/c-family/c-family-analyzer')
+
   const analyzerEnum = {
     EggAnalyzer,
     JavaScriptAnalyzer,
@@ -875,6 +889,7 @@ async function initAnalyzer(dir: any, args: any[] = [], printf?: any) {
     PhpAnalyzer,
     CAnalyzer,
     CppAnalyzer,
+    CFamilyAnalyzer,
   }
   let Analyzer: any
   if (Config.analyzer && Config.analyzer !== '') {

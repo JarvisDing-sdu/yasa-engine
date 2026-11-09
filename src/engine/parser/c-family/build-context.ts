@@ -37,9 +37,22 @@ export interface BuildContext extends CompileEntry {
   timeoutMs?: number
 }
 
-export interface Dependency { file: string; sha256: string; system: boolean }
-export interface Origin { file: string; line: number; column?: number; system: boolean }
-export interface MapSegment { generatedStartLine: number; generatedEndLine: number; origin: Origin }
+export interface Dependency {
+  file: string
+  sha256: string
+  system: boolean
+}
+export interface Origin {
+  file: string
+  line: number
+  column?: number
+  system: boolean
+}
+export interface MapSegment {
+  generatedStartLine: number
+  generatedEndLine: number
+  origin: Origin
+}
 export interface PreparedUnit {
   context: BuildContext
   text: string

@@ -162,6 +162,14 @@ class CAnalyzer extends Analyzer {
   private timedOutEntryPoints = 0
 
   /**
+   * Read completion evidence for drivers that require strict coverage reporting.
+   * @returns {number} Entrypoints that exhausted their time budget.
+   */
+  getTimedOutCEntryPointCount(): number {
+    return this.timedOutEntryPoints
+  }
+
+  /**
    * 地址值 → 它指向的存储位置（scope + Identifier/MemberAccess）。`*e = v` 与 `*e`
    * 通过 e 当前值查表，逐级定位多级指针指向的位置。
    */
