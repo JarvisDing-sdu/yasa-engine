@@ -34,6 +34,20 @@ if ! rm -rf dist > /dev/null; then
 fi
 success "清理历史结果完成"
 
+# 构建本地 C/C++ parser，确保打包使用最新 grammar。
+for PARSER_NAME in C CPP; do
+    PARSER_DIR="../uast/parser-$PARSER_NAME"
+    if ! npm ci --prefix "$PARSER_DIR" --ignore-scripts > /dev/null; then
+        alert "$PARSER_NAME parser 依赖安装失败"
+    fi
+    if ! npm --prefix "$PARSER_DIR" run build > /dev/null; then
+        alert "$PARSER_NAME parser 构建失败"
+    fi
+done
+if ! node scripts/patch-uast-parser-c-family.js; then
+    alert "C/C++ parser WASM 打包修复失败"
+fi
+
 # 步骤 1: 安装依赖
 info "步骤 1/8: 安装依赖 (npm install --ignore-scripts --package-lock=false)"
 if ! npm install --ignore-scripts --package-lock=false > /dev/null; then

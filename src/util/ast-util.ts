@@ -217,156 +217,118 @@ function annotateAST(node: any, options?: AnnotateOptions): void {
 
 /**
  * 给uast分配hash
- * 递归遍历 AST 节点树，为每个有 type 的节点计算并分配 nodehash
+ * 遍历 AST 节点树，为每个有 type 的节点计算并分配 nodehash
  * @param obj 根 AST 节点
  * @param visited 已访问节点集合（内部使用，外部调用时无需传入）
  */
-function addNodeHash(obj: any, visited?: WeakSet<any>): void {
-  if (!obj) return
-
-  if (!visited) {
-    visited = new WeakSet()
-  }
-
-  addNodeHashInternal(obj, visited)
-}
-
-/**
- * 内部递归函数，用于计算节点 hash
- * @param obj AST 节点
- * @param visited 已访问节点集合
- */
-// eslint-disable-next-line complexity
-function addNodeHashInternal(obj: any, visited: WeakSet<any>): void {
-  if (Array.isArray(obj)) {
-    const arrLen = obj.length
-    // 使用传统 for 循环，避免 forEach 的函数调用开销
-    for (let i = 0; i < arrLen; i++) {
-      const item = obj[i]
-      if (item && !visited.has(item)) {
-        addNodeHash(item, visited)
-      }
-    }
-    return
-  }
-
-  if (typeof obj !== 'object') return
-
-  // visited WeakSet 避免重复处理循环引用或共享节点
-  if (visited.has(obj)) return
-  visited.add(obj)
-
-  if (obj.type) {
-    const { loc } = obj
-    let content = getRawCode(obj)
-    // 防御：确保 content 为 string（getRawCode 可能返回非 string 值）
-    if (typeof content !== 'string') {
-      content = String(content ?? '')
-    }
-
-    // 非常重要的性能优化，尽量保留，对于特殊程序，如（content超过4000字符），可能快 10 倍
-    const MAX_CONTENT_LENGTH = 128
-    if (content?.length > MAX_CONTENT_LENGTH) {
-      const firstTen = content.substring(0, 64)
-      const lastTen = content.substring(content.length - 64)
-      content = `${firstTen}...${lastTen}`
-    }
-
-    let relateFilePath = obj.loc?.sourcefile
-    if (relateFilePath && config.maindirPrefix && relateFilePath.startsWith(config.maindirPrefix)) {
-      relateFilePath = relateFilePath.substring(config.maindirPrefix.length)
-    }
-
-    if (!obj._meta) {
-      obj._meta = {}
-    }
-
-    // 使用数组 join() 替代多次字符串拼接，减少中间对象创建
-    const parentHash = obj.parent?._meta?.nodehash || ''
-    const hashParts = [
-      content,
-      loc?.start?.line || '',
-      loc?.start?.column || '',
-      loc?.end?.line || '',
-      loc?.end?.column || '',
-      relateFilePath || '',
-      obj.type,
-      parentHash,
-    ]
-
-    const baseNodehash = md5(hashParts.join('_'))
-    let nodehash = baseNodehash
-
-    // 如果设置了全局 AST 管理器，检查 nodehash 是否已存在
-    // 如果已存在，则通过添加后缀来生成新的 nodehash，确保不替换原有对象
-    // TODO 符号值重构todo：现在的并行方式globalASTManager获取不到
-    const astManager = getGlobalASTManager()
-    if (astManager) {
-      let suffix = 0
-      while (astManager.has(nodehash)) {
-        suffix++
-        nodehash = `${baseNodehash}_${suffix}`
-      }
-      obj._meta.nodehash = nodehash
-      astManager.register(obj)
-    } else {
-      // 如果没有全局 AST 管理器，直接使用计算出的 nodehash
-      obj._meta.nodehash = nodehash
-    }
-  }
-
-  // 使用 for...in 直接遍历，避免 Object.keys() 创建新数组
-  for (const key in obj) {
-    // 跳过 parent 和 _meta
-    // 注意_meta中有decorators，还不能直接跳过
-    // TODO Java需要统一到decorators
-    if (
-      key === 'parent' ||
-      (key === '_meta' &&
-        (!Array.isArray(obj._meta?.decorators) ||
-          (Array.isArray(obj._meta?.decorators) && obj._meta?.decorators?.length === 0)) &&
-        (!Array.isArray(obj._meta?.annotations) ||
-          (Array.isArray(obj._meta?.annotations) && obj._meta?.annotations?.length === 0)))
-    ) {
+function addNodeHash(obj: any, visited: WeakSet<any> = new WeakSet()): void {
+  const pending: any[] = [obj]
+  while (pending.length) {
+    obj = pending.pop()
+    if (!obj || typeof obj !== 'object' || visited.has(obj)) continue
+    visited.add(obj)
+    if (Array.isArray(obj)) {
+      for (let i = obj.length - 1; i >= 0; i--) pending.push(obj[i])
       continue
-    } else if (key === '_meta' && Array.isArray(obj._meta?.annotations) && obj._meta?.annotations?.length > 0) {
-      addNodeHashInternal(obj._meta?.annotations, visited)
-    } else if (key === '_meta' && Array.isArray(obj._meta?.decorators) && obj._meta?.decorators?.length > 0) {
-      addNodeHashInternal(obj._meta?.decorators, visited)
-    } else {
-      if (!Object.prototype.hasOwnProperty.call(obj, key)) continue
-
-      const subObj = obj[key]
-      if (!subObj || typeof subObj !== 'object') continue
-
-      addNodeHashInternal(subObj, visited)
     }
+
+    if (obj.type) {
+      const { loc } = obj
+      let content = getRawCode(obj)
+      // 防御：确保 content 为 string（getRawCode 可能返回非 string 值）
+      if (typeof content !== 'string') {
+        content = String(content ?? '')
+      }
+
+      // 非常重要的性能优化，尽量保留，对于特殊程序，如（content超过4000字符），可能快 10 倍
+      const MAX_CONTENT_LENGTH = 128
+      if (content?.length > MAX_CONTENT_LENGTH) {
+        const firstTen = content.substring(0, 64)
+        const lastTen = content.substring(content.length - 64)
+        content = `${firstTen}...${lastTen}`
+      }
+
+      let relateFilePath = obj.loc?.sourcefile
+      if (relateFilePath && config.maindirPrefix && relateFilePath.startsWith(config.maindirPrefix)) {
+        relateFilePath = relateFilePath.substring(config.maindirPrefix.length)
+      }
+
+      if (!obj._meta) {
+        obj._meta = {}
+      }
+
+      // 使用数组 join() 替代多次字符串拼接，减少中间对象创建
+      const parentHash = obj.parent?._meta?.nodehash || ''
+      const hashParts = [
+        content,
+        loc?.start?.line || '',
+        loc?.start?.column || '',
+        loc?.end?.line || '',
+        loc?.end?.column || '',
+        relateFilePath || '',
+        obj.type,
+        parentHash,
+      ]
+
+      const baseNodehash = md5(hashParts.join('_'))
+      let nodehash = baseNodehash
+
+      // 如果设置了全局 AST 管理器，检查 nodehash 是否已存在
+      // 如果已存在，则通过添加后缀来生成新的 nodehash，确保不替换原有对象
+      // TODO 符号值重构todo：现在的并行方式globalASTManager获取不到
+      const astManager = getGlobalASTManager()
+      if (astManager) {
+        let suffix = 0
+        while (astManager.has(nodehash)) {
+          suffix++
+          nodehash = `${baseNodehash}_${suffix}`
+        }
+        obj._meta.nodehash = nodehash
+        astManager.register(obj)
+      } else {
+        // 如果没有全局 AST 管理器，直接使用计算出的 nodehash
+        obj._meta.nodehash = nodehash
+      }
+    }
+
+    // Push children in reverse enumeration order to retain recursive preorder.
+    const children: any[] = []
+    for (const key in obj) {
+      if (key === 'parent') continue
+      if (key === '_meta') {
+        if (Array.isArray(obj._meta?.annotations) && obj._meta.annotations.length > 0) {
+          children.push(obj._meta.annotations)
+        } else if (Array.isArray(obj._meta?.decorators) && obj._meta.decorators.length > 0) {
+          children.push(obj._meta.decorators)
+        }
+      } else if (Object.prototype.hasOwnProperty.call(obj, key)) {
+        const child = obj[key]
+        if (child && typeof child === 'object') children.push(child)
+      }
+    }
+    for (let i = children.length - 1; i >= 0; i--) pending.push(children[i])
   }
 }
 
 /**
- * 递归删除 AST 节点树中所有节点的 parent 指针
+ * 删除 AST 节点树中所有节点的 parent 指针
  * @param obj 根 AST 节点
  */
 function deleteParent(obj: any) {
-  if (typeof obj !== 'object' || obj === null) {
-    return obj
-  }
-
-  if (Array.isArray(obj)) {
-    obj.forEach((item) => deleteParent(item))
-    return obj
-  }
-
-  if ('parent' in obj) {
-    delete obj.parent
-  }
-
-  for (const key in obj) {
-    if (obj.hasOwnProperty(key) && typeof obj[key] === 'object' && obj[key] !== null) {
-      deleteParent(obj[key])
+  if (!obj || typeof obj !== 'object') return obj
+  const pending = [obj]
+  const visited = new WeakSet<object>()
+  while (pending.length) {
+    const current = pending.pop()
+    if (!current || typeof current !== 'object' || visited.has(current)) continue
+    visited.add(current)
+    if (!Array.isArray(current)) delete current.parent
+    for (const key of Object.keys(current)) {
+      const child = current[key]
+      if (child && typeof child === 'object') pending.push(child)
     }
   }
+  return obj
 }
 
 /**

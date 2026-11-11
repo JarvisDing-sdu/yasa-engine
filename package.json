@@ -209,7 +209,16 @@
       "deps/uast4py/uast4py",
       "node_modules/tree-sitter-php/*.wasm",
       "node_modules/web-tree-sitter/web-tree-sitter.wasm",
-      "node_modules/tree-sitter-c/*.wasm"
+      "node_modules/tree-sitter-c/*.wasm",
+      "node_modules/tree-sitter-cpp/*.wasm",
+      "../uast/parser-C/dist/grammar/*.wasm",
+      "node_modules/@ant-yasa/uast-parser-c/dist/grammar/*.wasm",
+      "../uast/parser-C/node_modules/web-tree-sitter/*.wasm",
+      "../uast/parser-C/node_modules/web-tree-sitter/package.json",
+      "../uast/parser-C/node_modules/web-tree-sitter/web-tree-sitter.cjs",
+      "../uast/parser-CPP/node_modules/tree-sitter-cpp/*.wasm",
+      "node_modules/web-tree-sitter/package.json",
+      "node_modules/web-tree-sitter/web-tree-sitter.cjs"
     ],
     "targets": [
       "node18-macos-arm64",

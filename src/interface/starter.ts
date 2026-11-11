@@ -137,6 +137,12 @@ async function execute(dir: any, args: any[] = [], printf?: any) {
       selectedLanguage = args[index].slice('--language='.length)
     }
   }
+  const optionEnd = args.indexOf('--')
+  const optionArgs = optionEnd < 0 ? args : args.slice(0, optionEnd)
+  if (optionArgs.some((arg: unknown) => typeof arg === 'string' && (arg === '--cCompileCommands' || arg.startsWith('--cCompileCommands=')))) {
+    const { runCompilerDumpCLI } = require('./compiler-dump')
+    return runCompilerDumpCLI(args)
+  }
   if (selectedLanguage === 'c-cpp') {
     const { runCfamilyCLI } = require('./c-family-runner')
     return runCfamilyCLI(dir, args)
@@ -1148,7 +1154,8 @@ async function dumpAST(apps: any, printf: any) {
     const ast = Parser.parseSingleFile(app.file, Config, sourceCodeCache)
     deleteParent(ast)
     if (Config.language !== 'golang') {
-      const parseResult = JSON.stringify(ast)
+      const { stringifyJsonWithFallback } = require('../util/deep-json')
+      const parseResult = stringifyJsonWithFallback(ast)
       if (Config.ASTFileOutput) {
         printf(Config.ASTFileOutput, parseResult)
       } else {

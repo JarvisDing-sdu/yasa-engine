@@ -360,7 +360,7 @@ async function saveAstToCache(ast: any, jsonFilePath: string): Promise<boolean> 
       // 使用 skipParentReplacer 跳过 parent 属性
       // 序列化时跳过 parent，避免循环引用问题和减少文件大小
       // 原 AST 对象保持不变（仍然有 parent，用于返回给用户）
-      const astSerialized = JSON.stringify(ast, skipParentReplacer)
+      const astSerialized = require('../../util/deep-json').stringifyJsonWithFallback(ast, skipParentReplacer)
       fs.writeFile(jsonFilePath, astSerialized, 'utf8', (err: NodeJS.ErrnoException | null) => {
         if (err) {
           logger.warn(`Failed to write AST cache to ${jsonFilePath}: ${err.message}`)
@@ -445,7 +445,7 @@ function extractAndDumpPackageAst(packageInfo: any, reportDir: string, config: L
         if (node && typeof node === 'object' && node.type === 'CompileUnit') {
           const fileName = `${md5(key)}.json`
           const astFilePath = path.join(reportDir, fileName)
-          fs.writeFileSync(astFilePath, JSON.stringify(node, skipParentReplacer))
+          fs.writeFileSync(astFilePath, require('../../util/deep-json').stringifyJsonWithFallback(node, skipParentReplacer))
           astFileList.push(fileName)
         }
         continue
@@ -539,7 +539,7 @@ async function dumpAllAST(results: any, reportDir: string, config: LanguageParse
       for (const [filename, ast] of Object.entries(results)) {
         const fileName = `${md5(filename)}.json`
         const astFilePath = path.join(reportDir, fileName)
-        fs.writeFileSync(astFilePath, JSON.stringify(ast, skipParentReplacer))
+        fs.writeFileSync(astFilePath, require('../../util/deep-json').stringifyJsonWithFallback(ast, skipParentReplacer))
         astFileList.push(fileName)
       }
     }

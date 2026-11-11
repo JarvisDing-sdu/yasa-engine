@@ -164,10 +164,10 @@ function validateDriver(argv: string[]): boolean {
     throw new Error('arguments must be a nonempty array of strings without NUL')
   }
   const driver = path.basename(argv[0])
-  if (!/^(?:[A-Za-z0-9_.]+-)*(?:clang\+\+|clang|gcc|g\+\+)(?:-\d+(?:\.\d+)*)?$/.test(driver)) {
-    throw new Error(`Unsupported compiler/wrapper ${JSON.stringify(argv[0])}; use a direct Clang/GCC driver`)
+  if (!/^(?:[A-Za-z0-9_.]+-)*(?:clang\+\+|clang|gcc|g\+\+|cc|c\+\+)(?:-\d+(?:\.\d+)*)?$/.test(driver)) {
+    throw new Error(`Unsupported compiler/wrapper ${JSON.stringify(argv[0])}; use a direct Clang/GCC/cc/c++ driver`)
   }
-  return /(?:clang\+\+|g\+\+)(?:-\d+(?:\.\d+)*)?$/.test(driver)
+  return /(?:clang\+\+|g\+\+|c\+\+)(?:-\d+(?:\.\d+)*)?$/.test(driver)
 }
 
 /**

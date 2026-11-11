@@ -48,3 +48,38 @@ Custom rules use declared API names and the existing trailing prefix wildcard sy
 ## Acceptance evidence
 
 The integration repository preserves the frozen 27 buildable fixtures, independent scorer, complete old C/CPP regression scores, source snapshots, and all failed real-project attempts. It has 13 dangerous cases, 13 safe controls, and one intentional preprocessing failure. The original C and C++ baselines are not rewritten.
+
+## Export one compiler-configured AST
+
+To inspect one C or C++ translation unit under a compile database command, use
+`--cCompileCommands` with the single-file `--dumpAST` mode:
+
+```sh
+node --import tsx src/main.ts --language c --dumpAST \
+  --sourcePath /path/to/project/src/file.c \
+  --cCompileCommands /path/to/build/compile_commands.json \
+  --report /path/to/new-ast.json
+```
+
+Use `--language cpp` for a C++ command. The report path must not already exist;
+without `--report`, the JSON is written to stdout. This differs from the legacy
+single-file exporter, which can overwrite an existing report. A source file with
+multiple distinct compilation entries is rejected and the error lists their IDs;
+pass `--cCompileEntry <ID>` to choose one explicitly. Identical entries are
+considered one command. Other C preprocessor CLI flags do not combine with this
+mode; use the build's compilation command instead.
+
+This mode runs the recorded direct `clang`, `gcc`, `cc` or C++ driver with a
+conservative allowlist of preprocessing options. Unsupported options, including
+compiler forwarding flags, are reported as errors rather than silently ignored.
+Only use a compilation database whose compiler commands you trust. The command
+uses the current process environment; a compilation database does not record the
+original build environment. No object file is produced.
+
+The AST contains the selected configuration only. System-header contents are
+masked, while project headers are retained. `loc` refers to preprocessed input;
+`_meta.originalLocation` records the presumed original file and **start line**
+from compiler line markers. Original columns and end ranges are not inferred.
+The root's `_meta.compilerDump` records the selected command, the masking policy,
+compiler stderr, and whether tree-sitter recorded syntax errors. A successful
+export with zero syntax errors does not establish full semantic coverage.

@@ -69,6 +69,8 @@ describe('C-family compilation contexts', () => {
       [['clang', '--', 'main.c'], 'c'],
       [['clang', '--driver-mode=g++', 'main.c'], 'cpp'],
       [['/usr/bin/g++-13', 'main.c'], 'cpp'],
+      [['cc', 'main.c'], 'c'],
+      [['c++', 'main.c'], 'cpp'],
     ] as [string[], string][]) {
       const [entry] = await database([record(argv)])
       assert.strictEqual(resolveLanguage(entry), language, argv.join(' '))
