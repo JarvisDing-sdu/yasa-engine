@@ -23,6 +23,7 @@ export function decodeLineMarkers(raw: string, cwd: string): { text: string; sou
   const lines = raw.split('\n')
   const sourceMap: SourceSegment[] = []
   let physicalFile: string | undefined
+  const includeStack: Array<string | undefined> = []
   let current: SourceSegment | undefined
   for (let index = 0; index < lines.length; index++) {
     const marker = /^#\s+(\d+)\s+"((?:\\.|[^"\\])*)"(.*)$/.exec(lines[index])
@@ -32,7 +33,15 @@ export function decodeLineMarkers(raw: string, cwd: string): { text: string; sou
     const flags = marker[3].trim().split(/\s+/)
     const virtual = filename.startsWith('<')
     const file = virtual ? filename : path.resolve(cwd, filename)
-    if (!virtual && (!physicalFile || flags.includes('1') || flags.includes('2'))) physicalFile = file
+    // Enter/return markers describe the physical include stack even when the
+    // return name is virtual (<command-line>) or changed by #line.
+    if (flags.includes('1')) {
+      includeStack.push(physicalFile)
+      if (!virtual) physicalFile = file
+    } else if (flags.includes('2')) {
+      if (includeStack.length) physicalFile = includeStack.pop()
+      else if (!virtual) physicalFile = file
+    } else if (!virtual && !physicalFile) physicalFile = file
     current = {
       generatedStartLine: index + 2,
       generatedEndLine: lines.length,

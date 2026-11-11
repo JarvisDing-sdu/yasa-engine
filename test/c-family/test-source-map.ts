@@ -13,6 +13,18 @@ describe('compiler source provenance', () => {
     assert.strictEqual('column' in mapOrigin(sourceMap, 6)!, false)
   })
 
+  it('restores physical files after virtual returns and #line include returns', () => {
+    const raw = '# 0 "main.c"\n# 0 "<built-in>"\n# 0 "<command-line>"\n' +
+      '# 1 "sys.h" 1 3\nint system_value;\n# 0 "<command-line>" 2\n' +
+      '# 1 "main.c"\n# 77 "logical.c"\nint before;\n' +
+      '# 1 "header.h" 1\nint header;\n# 79 "logical.c" 2\nint after;\n'
+    const { sourceMap } = decodeLineMarkers(raw, '/project')
+    assert.strictEqual(mapOrigin(sourceMap, 5)!.physicalFile, '/project/sys.h')
+    assert.deepStrictEqual(mapOrigin(sourceMap, 9), { file: '/project/logical.c', line: 77, system: false, physicalFile: '/project/main.c' })
+    assert.strictEqual(mapOrigin(sourceMap, 11)!.physicalFile, '/project/header.h')
+    assert.deepStrictEqual(mapOrigin(sourceMap, 13), { file: '/project/logical.c', line: 79, system: false, physicalFile: '/project/main.c' })
+  })
+
   it('retains project angled includes and records system declarations independently', () => {
     const raw = '# 1 "main.cpp"\nint a;\n# 1 "custom.h" 1\nint project_body() { return 1; }\n# 1 "stdlib.h" 1 3\nint system(const char *);\n'
     const decoded = decodeLineMarkers(raw, '/project')
