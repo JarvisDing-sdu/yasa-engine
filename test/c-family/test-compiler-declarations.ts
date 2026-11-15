@@ -41,6 +41,42 @@ describe('streaming compiler declarations', () => {
     return readCompilerDeclarations(file)
   }
 
+  it('records the implicit inline linkage of constexpr and consteval functions', async () => {
+    const functions = [true, false].map((immediate, index) => ({
+      id: 'constant-' + index, kind: 'FunctionDecl', name: 'constant' + index,
+      loc: { offset: index * 10 }, range: range(index * 10, index * 10 + 5),
+      type: { qualType: 'int ()' }, constexpr: true, immediate,
+      inner: [{ kind: 'CompoundStmt', range: range(index * 10 + 2, index * 10 + 5), inner: [] }],
+    }))
+    const result = await read(translationUnit(functions))
+    assert.deepStrictEqual(result.declarations.map(declaration => declaration.inline), [true, true])
+  })
+
+  it('records the implicit inline linkage of friend definitions inside classes', async () => {
+    const result = await read(translationUnit([{ kind: 'CXXRecordDecl', name: 'Box', inner: [{ kind: 'FriendDecl', inner: [{
+      id: 'friend', kind: 'FunctionDecl', name: 'operator==', loc: { offset: 3 }, range: range(0, 9), type: { qualType: 'bool (Box, Box)' },
+      inner: [{ kind: 'CompoundStmt', range: range(6, 9), inner: [] }],
+    }] }] }]))
+    assert.strictEqual(result.declarations[0].inline, true)
+  })
+
+  it('keeps constexpr variables separate from implicitly inline functions', async () => {
+    const result = await read(translationUnit([variable('constant', 0, { constexpr: true })]))
+    assert.strictEqual(result.declarations[0].inline, undefined)
+  })
+
+  it('preserves consumer subtrees when source coordinates follow inner children', async () => {
+    const selected = { kind: 'NamespaceDecl', inner: [{ kind: 'FunctionDecl', id: 'late', name: 'late',
+      loc: { offset: 3 }, range: range(2, 8), type: { qualType: 'int ()' },
+      inner: [{ kind: 'CompoundStmt', range: range(5, 8), inner: [{ kind: 'ReturnStmt', inner: [{ kind: 'IntegerLiteral', value: '1' }] }] }],
+    }], range: range(0, 9) }
+    const file = path.join(directory, 'late-coordinates.json')
+    fs.writeFileSync(file, JSON.stringify(translationUnit([selected])))
+    const consumed: unknown[] = []
+    await readCompilerDeclarations(file, { shouldRetain: node => node.range?.begin?.offset === 0, consume: node => consumed.push(node) })
+    assert.deepStrictEqual(consumed, [selected])
+  })
+
   it('preserves declaration types and byte ranges, zero offsets, and system declarations', async () => {
     const metadata = await read(
       translationUnit([

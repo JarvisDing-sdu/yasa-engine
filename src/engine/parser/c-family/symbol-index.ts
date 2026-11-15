@@ -63,9 +63,14 @@ function declarationKey(
   internal: boolean,
   staticLocal: boolean
 ): string {
-  const linkageName = declaration.mangledName || declaration.name
   const point = coordinates.location(declaration.offset)
   const source = mapOrigin(unit.sourceMap, point.line)
+  // Uninstantiated templates lack a link identity. Keep their source
+  // declarations separate, including overloads with identical function types
+  // but different template parameter lists. Concrete instantiations use mangling.
+  const linkageName = declaration.mangledName ||
+    (declaration.kind === 'FunctionDecl' && declaration.languageLinkage === 'C++'
+      ? JSON.stringify([declaration.scopeNames, declaration.name, declaration.type, source?.physicalFile, source?.line, point.column]) : declaration.name)
   const ownerName = owner?.mangledName || owner?.name || ''
   const localIdentity = staticLocal
     ? `${ownerName}:${declaration.name}:${source?.file}:${source?.line}:${point.column}`
@@ -132,6 +137,7 @@ function runtimeAbiName(unit: CompilerPreparedUnit, linkageName: string): string
 function isLibraryDeclaration(declaration: CompilerDeclaration, abiName: string, internal: boolean): boolean {
   return (
     declaration.kind === 'FunctionDecl' &&
+    !declaration.template &&
     /^[A-Za-z_]\w*$/.test(abiName) &&
     !abiName.startsWith('_Z') &&
     declaration.name !== 'main' &&
@@ -193,7 +199,7 @@ export function buildSymbolIndex(units: CompilerPreparedUnit[]): Map<string, Map
   }
   for (const [key, entries] of definitions) {
     const unique = [...new Map(entries.map((e) => [`${e.unit}:${e.declaration.offset}`, e])).values()]
-    if (unique.length > 1 && !unique.every((e) => e.declaration.inline && e.body === unique[0].body)) {
+    if (unique.length > 1 && !unique.every((e) => (e.declaration.inline || e.declaration.template) && e.body === unique[0].body)) {
       throw new Error(`Conflicting definitions in one link domain: ${unique[0].declaration.name} (${key})`)
     }
   }

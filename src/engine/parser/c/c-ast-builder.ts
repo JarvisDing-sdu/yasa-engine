@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-require-imports */
 const fs = require('fs')
 const path = require('path')
-const { Parser: CUastParser } = require('@ant-yasa/uast-parser-c')
+const { Parser: CUastParser } = require('@ant-yasa/uast-parser-cpp')
 const Config = require('../../../config')
 
 let cParser: InstanceType<typeof CUastParser> | null = null
@@ -13,7 +13,7 @@ let initPromise: Promise<void> | null = null
  */
 async function ensureInitialized(): Promise<void> {
   if (!cParser) {
-    cParser = new CUastParser()
+    cParser = new CUastParser({ language: 'c' })
     initPromise = cParser.init()
   }
   if (initPromise) {

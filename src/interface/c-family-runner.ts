@@ -28,6 +28,7 @@ export interface CFamilyRequest {
   reportDir: string
   workers: number
   ruleConfigFile?: string
+  astBackend?: 'tree-sitter' | 'clang'
   dumpAllCG?: boolean
 }
 
@@ -164,13 +165,14 @@ function findUncoveredSources(sourcePath: string, report: string, entries: Compi
 async function parseDomainUnits(
   valid: CompilerPreparedUnit[],
   index: DomainSymbolIndex,
-  state: CFamilyRunState
+  state: CFamilyRunState,
+  backend: 'tree-sitter' | 'clang' = 'tree-sitter'
 ): Promise<FamilyParsedUnit[]> {
   const { manifest, save } = state
   const parsed: FamilyParsedUnit[] = []
   for (const unit of valid) {
     // eslint-disable-next-line no-await-in-loop -- Preserve shared parser initialization and per-unit manifest checkpoints in selection order.
-    const parsedUnit = await parsePreparedUnit(unit, index.get(unit.context.unitId)!)
+    const parsedUnit = await parsePreparedUnit(unit, index.get(unit.context.unitId)!, backend)
     parsed.push(parsedUnit)
     const row = manifest.units.find((r: any) => r.unitId === unit.context.unitId)
     if (parsedUnit.status === 'parsed') row.status = 'parsed'
@@ -340,7 +342,7 @@ async function analyzeDomain(
     if (!valid.length) throw new Error('No prepared translation units in this domain')
     for (const unit of valid) retainLibraryBodies(unit, modeledAPIs(originalRules))
     const index = buildSymbolIndex(valid)
-    const ready = await parseDomainUnits(valid, index, state)
+    const ready = await parseDomainUnits(valid, index, state, request.astBackend)
     if (!ready.length) throw new Error('No parsed translation units in this domain')
     const directory = path.join(report, 'domains', createHash('sha256').update(domainId).digest('hex'))
     fs.mkdirSync(directory, { recursive: true })
@@ -414,6 +416,7 @@ export async function runCfamily(request: CFamilyRequest): Promise<{ status: str
   const manifest: any = {
     version: 1,
     language: 'c-cpp',
+    astBackend: request.astBackend || 'tree-sitter',
     status: 'running',
     sourcePath: path.resolve(request.sourcePath),
     units: [],
@@ -428,6 +431,8 @@ export async function runCfamily(request: CFamilyRequest): Promise<{ status: str
   }
   const state: CFamilyRunState = { report, manifest, save, results: [], graphs: [], entryPointCount: 0 }
   try {
+    if (request.astBackend && !['tree-sitter', 'clang'].includes(request.astBackend))
+      throw new Error('Unknown astBackend')
     if (!Number.isSafeInteger(request.workers) || request.workers < 1)
       throw new Error('workerCount must be a positive integer')
     const entries = await readCompilationDatabase(path.resolve(request.compileCommands))
@@ -528,10 +533,12 @@ export async function runCfamilyCLI(directory: string | null, args: string[]): P
     .option('--ruleConfigFile <file>')
     .option('--checkerPackIds <ids>')
     .option('--checkerIds <ids>')
+    .option('--astBackend <backend>', 'UAST frontend: tree-sitter or clang', 'tree-sitter')
     .option('--dumpAllCG')
   try {
     program.parse(args, { from: 'user' })
     const options = program.opts()
+    if (!['tree-sitter', 'clang'].includes(options.astBackend)) throw new Error('Unknown --astBackend')
     if (!options.sourcePath || !fs.statSync(options.sourcePath).isDirectory())
       throw new Error('Mixed scanning requires a source directory')
     if (options.checkerPackIds && options.checkerPackIds !== 'taint-flow-c-family-default')
@@ -551,6 +558,7 @@ export async function runCfamilyCLI(directory: string | null, args: string[]): P
       workers: Number(options.workerCount),
       reportDir: options.report,
       ruleConfigFile: options.ruleConfigFile,
+      astBackend: options.astBackend,
       dumpAllCG: options.dumpAllCG || options.checkerIds?.split(',').includes('callgraph'),
     })
     process.exitCode = result.status === 'complete' ? 0 : 2

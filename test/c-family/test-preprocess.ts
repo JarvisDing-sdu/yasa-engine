@@ -16,7 +16,7 @@ describe('real compiler preprocessing and library declarations', function () {
     fs.writeFileSync(path.join(root, 'main.c'), '#include <stdlib.h>\n#include <api.h>\nint main(void) { return helper(); }\n')
     const db = path.join(root, 'compile_commands.json')
     fs.writeFileSync(db, JSON.stringify(['main.cpp', 'main.c'].map(file => ({
-      directory: root, file, arguments: ['/usr/bin/clang', '-I', root, '-c', file],
+      directory: root, file, arguments: ['clang', '-I', root, '-c', file],
     }))))
     const entries = await readCompilationDatabase(db)
     const contexts = selectBuildContexts(entries, { version: 1, profileId: 'test', units: entries.map(e => ({ entryId: e.entryId, domainId: e.sourceFile })) })
@@ -41,7 +41,7 @@ describe('real compiler preprocessing and library declarations', function () {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'yasa-missing-header-'))
     fs.writeFileSync(path.join(root, 'main.c'), '#include "generated.h"\nint main(void) { return 0; }\n')
     const db = path.join(root, 'compile_commands.json')
-    fs.writeFileSync(db, JSON.stringify([{ directory: root, file: 'main.c', arguments: ['/usr/bin/clang', '-c', 'main.c'] }]))
+    fs.writeFileSync(db, JSON.stringify([{ directory: root, file: 'main.c', arguments: ['clang', '-c', 'main.c'] }]))
     const entries = await readCompilationDatabase(db)
     const [context] = selectBuildContexts(entries, { version: 1, profileId: 'missing', units: [{ entryId: entries[0].entryId, domainId: 'app' }] })
     const unit = await preprocessUnit(context, path.join(root, 'out'))

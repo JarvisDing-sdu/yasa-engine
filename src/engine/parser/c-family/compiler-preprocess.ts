@@ -3,11 +3,13 @@ import * as path from 'path'
 import { createHash } from 'crypto'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
+import { pipeline } from 'stream/promises'
 import type { BuildContext, Diagnostic } from './build-context'
 import type { SourceSegment } from './source-map'
 import { decodeLineMarkers } from './source-map'
-import type { CompilerMetadata } from './compiler-declarations'
+import type { CompilerMetadata, CompilerAstConsumer } from './compiler-declarations'
 import { readCompilerDeclarations } from './compiler-declarations'
+import { compactCompilerJson } from './compiler-json'
 
 const execute = promisify(execFile)
 const sha = (text: string | Buffer) => createHash('sha256').update(text).digest('hex')
@@ -117,7 +119,8 @@ async function readDeclarationMetadata(
   context: BuildContext,
   directory: string,
   env: NodeJS.ProcessEnv,
-  timeout: number
+  timeout: number,
+  consumer?: CompilerAstConsumer
 ): Promise<CompilerMetadata> {
   const compiler = context.argv[0]
   const astFile = path.join(directory, 'compiler-ast.json')
@@ -134,19 +137,24 @@ async function readDeclarationMetadata(
   fs.writeFileSync(path.join(directory, 'declarations.argv.json'), JSON.stringify([compiler, ...args], null, 2))
   // Stream the large compiler AST to disk instead of buffering libc++ in memory.
   const { spawn } = await import('child_process')
-  await new Promise<void>((resolve, reject) => {
-    const stdout = fs.openSync(astFile, 'w')
-    const stderr = fs.openSync(path.join(directory, 'declarations.stderr'), 'w')
-    const child = spawn(compiler, args, { cwd: context.directory, env, timeout, stdio: ['ignore', stdout, stderr] })
-    child.once('error', reject)
-    child.once('close', (code, signal) => {
-      fs.closeSync(stdout)
-      fs.closeSync(stderr)
-      if (code === 0) resolve()
-      else reject(new Error(`Compiler declaration analysis failed (${code}, ${signal})`))
+  const stderr = fs.openSync(path.join(directory, 'declarations.stderr'), 'w')
+  let child: ReturnType<typeof spawn> | undefined
+  try {
+    const compilerChild = spawn(compiler, args, { cwd: context.directory, env, timeout, stdio: ['ignore', 'pipe', stderr] })
+    child = compilerChild
+    const completion = new Promise<void>((resolve, reject) => {
+      compilerChild.once('error', reject)
+      compilerChild.once('close', (code, signal) => {
+        if (code === 0) resolve()
+        else reject(new Error(`Compiler declaration analysis failed (${code}, ${signal})`))
+      })
     })
-  })
-  return readCompilerDeclarations(astFile)
+    await Promise.all([completion, pipeline(compilerChild.stdout!, compactCompilerJson(), fs.createWriteStream(astFile))])
+  } catch (error) {
+    child?.kill()
+    throw error
+  } finally { fs.closeSync(stderr) }
+  return readCompilerDeclarations(astFile, consumer)
 }
 
 /**
@@ -155,7 +163,11 @@ async function readDeclarationMetadata(
  * @param outDir Parent directory for compiler products.
  * @returns {Promise<CompilerPreparedUnit>} Prepared unit or diagnostics from a failed compiler stage.
  */
-export async function preprocessUnit(context: BuildContext, outDir: string): Promise<CompilerPreparedUnit> {
+export async function preprocessUnit(
+  context: BuildContext,
+  outDir: string,
+  astConsumer?: (raw: string, sourceMap: SourceSegment[]) => CompilerAstConsumer
+): Promise<CompilerPreparedUnit> {
   const directory = path.join(outDir, context.unitId)
   fs.mkdirSync(directory, { recursive: true })
   const result: CompilerPreparedUnit = {
@@ -249,7 +261,7 @@ export async function preprocessUnit(context: BuildContext, outDir: string): Pro
     ) {
       throw new Error('Input dependencies changed during compiler preprocessing')
     }
-    result.metadata = await readDeclarationMetadata(context, directory, env, timeout)
+    result.metadata = await readDeclarationMetadata(context, directory, env, timeout, astConsumer?.(raw, decoded.sourceMap))
     if (result.dependencies.some((d) => sha(fs.readFileSync(d.file)) !== d.sha256))
       throw new Error('Input dependencies changed during declaration analysis')
     const environmentNames = [

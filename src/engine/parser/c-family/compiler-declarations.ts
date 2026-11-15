@@ -34,6 +34,11 @@ export interface CompilerMetadata {
   unsupported: { kind: string; offset: number; type?: string; globalInitializer?: boolean }[]
 }
 
+export interface CompilerAstConsumer {
+  shouldRetain(node: AstNode): boolean
+  consume(node: AstNode): void
+}
+
 interface Location {
   offset?: number
   tokLen?: number
@@ -52,6 +57,8 @@ interface AstNode {
   storageClass?: string
   inline?: boolean
   init?: string
+  constexpr?: boolean
+  immediate?: boolean
   language?: string
   referencedDecl?: { id?: string; name?: string }
 }
@@ -124,6 +131,8 @@ interface AstReaderState {
   bodies: WeakMap<AstNode, { range?: CompilerDeclaration['range'] }>
   trivialTypes: Set<string>
   rootComplete: boolean
+  consumer?: CompilerAstConsumer
+  retained: WeakMap<AstNode, boolean>
 }
 
 interface DeclarationScope {
@@ -346,7 +355,9 @@ function copyDeclarationDetails(
   if (node.mangledName !== undefined) declaration.mangledName = node.mangledName
   if (node.previousDecl !== undefined) declaration.previousDecl = node.previousDecl
   if (node.storageClass !== undefined) declaration.storage = node.storageClass
-  if (node.inline !== undefined) declaration.inline = node.inline
+  const implicitInline = node.kind === 'FunctionDecl' && (node.constexpr || node.immediate)
+  if (node.inline !== undefined || implicitInline)
+    declaration.inline = !!(node.inline || implicitInline)
   if (node.kind !== 'FunctionDecl' && functionId !== undefined) declaration.functionId = functionId
   if (body?.range) declaration.bodyRange = body.range
 }
@@ -389,6 +400,9 @@ function collectDeclaration(
   if (stack.some((frame) => frame.key === 'inner' && frame.value?.kind === 'FunctionTemplateDecl'))
     declaration.template = true
   copyDeclarationDetails(declaration, node, scope.functionId, body)
+  if (body && stack.some(frame => frame.key === 'inner' &&
+    ['CXXRecordDecl', 'ClassTemplateSpecializationDecl', 'ClassTemplatePartialSpecializationDecl'].includes(frame.value?.kind || '')))
+    declaration.inline = true
   state.metadata.declarations.push(declaration)
 }
 
@@ -447,8 +461,22 @@ function createAstParser(state: AstReaderState): JsonParser {
     const parent = this.stack[this.stack.length - 1]
     if (typeof this.key !== 'number' || parent.key !== 'inner') return
     if (isAstNode(value)) collectNode(value, parent.value, this.stack, state)
-    // Never leave completed children reachable from an ancestor's inner array.
-    // In particular, do not prune ordinary properties such as type and range.
+    if (state.consumer && isAstNode(value)) {
+      const ancestor = this.stack.find(frame => frame.key === 'inner' && frame.value?.kind && frame.value.kind !== 'TranslationUnitDecl')?.value
+      const top = ancestor || value
+      // JSON member order is unrestricted. Defer filtering until the active
+      // declaration has source coordinates, preserving children parsed earlier.
+      if (ancestor && !isOffset(ancestor.range?.begin?.offset) && !isOffset(ancestor.loc?.offset)) return
+      let retain = state.retained.get(top)
+      if (retain === undefined) {
+        retain = state.consumer.shouldRetain(top)
+        state.retained.set(top, retain)
+      }
+      if (retain && ancestor) return
+      if (retain) state.consumer.consume(value)
+    }
+    // Selected project subtrees are released after their consumer runs. Other
+    // inner children are freed immediately. Ordinary type/range fields survive.
     delete this.value[this.key]
   }
   return parser
@@ -461,12 +489,14 @@ function createAstParser(state: AstReaderState): JsonParser {
  * @param file Path to the compiler's UTF-8 JSON AST output.
  * @returns {Promise<CompilerMetadata>} Declarations, references, and unsupported explicit syntax.
  */
-export async function readCompilerDeclarations(file: string): Promise<CompilerMetadata> {
+export async function readCompilerDeclarations(file: string, consumer?: CompilerAstConsumer): Promise<CompilerMetadata> {
   const state: AstReaderState = {
     metadata: { declarations: [], references: [], unsupported: [] },
     bodies: new WeakMap(),
     trivialTypes: new Set(),
     rootComplete: false,
+    consumer,
+    retained: new WeakMap(),
   }
   const parser = createAstParser(state)
   const utf8 = new TextDecoder('utf-8', { fatal: true })

@@ -2,6 +2,12 @@ import * as assert from 'assert'
 import { decodeLineMarkers, mapOrigin, projectText, RawCoordinates } from '../../src/engine/parser/c-family/source-map'
 
 describe('compiler source provenance', () => {
+  it('decodes compiler UTF-8 octal paths and escaped filename characters', () => {
+    const raw = String.raw`# 1 "/project/\346\226\207\346\241\243/a\"b\\c.c"` + '\nint value;\n'
+    const { sourceMap } = decodeLineMarkers(raw, '/project')
+    assert.strictEqual(mapOrigin(sourceMap, 2)!.file, '/project/文档/a"b\\c.c')
+  })
+
   it('maps physical includes and logical line directives separately', () => {
     const raw = '# 1 "main.c"\nint a;\n# 1 "api.h" 1\nint b;\n# 50 "virtual.c"\nint c;\n# 3 "main.c" 2\nint d;\n'
     const { text, sourceMap } = decodeLineMarkers(raw, '/project')

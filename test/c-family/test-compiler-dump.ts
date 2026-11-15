@@ -42,6 +42,32 @@ describe('compiler-configured dumpAST', function () {
   })
   afterEach(() => fs.rmSync(dir, { recursive: true, force: true }))
 
+  it('exports every distinct compile context through dumpAllAST and preserves failures', () => {
+    const broken = path.join(dir, 'broken.c')
+    fs.writeFileSync(broken, '#include "missing-required.h"\n')
+    const records = argv.map(args => ({ directory: dir, file: source, arguments: args }))
+    records.push({ directory: dir, file: broken, arguments: ['clang', '-c', broken] })
+    fs.writeFileSync(database, JSON.stringify(records))
+    const result = spawnSync(process.execPath, ['--import', 'tsx', 'src/main.ts',
+      '--sourcePath', dir, '--language', 'c', '--dumpAllAST', '--cCompileCommands', database,
+      '--report', report], { cwd: engine, encoding: 'utf8' })
+    assert.strictEqual(result.status, 2, result.stderr)
+    const manifest = JSON.parse(fs.readFileSync(path.join(report, 'manifest.json'), 'utf8'))
+    assert.strictEqual(manifest.total, 3)
+    assert.strictEqual(manifest.completed, 3)
+    assert.deepStrictEqual(manifest.results.map((row: any) => row.status), ['no_syntax_errors', 'no_syntax_errors', 'failed'])
+    assert.strictEqual(manifest.results[2].output, null)
+    for (const row of manifest.results.slice(0, 2)) {
+      const ast = JSON.parse(fs.readFileSync(path.join(report, row.output), 'utf8'))
+      assert.strictEqual(ast._meta.compilerDump.entryId, row.entryId)
+    }
+    const repeat = spawnSync(process.execPath, ['--import', 'tsx', 'src/main.ts',
+      '--sourcePath', dir, '--language', 'c', '--dumpAllAST', '--cCompileCommands', database,
+      '--report', report], { cwd: engine, encoding: 'utf8' })
+    assert.notStrictEqual(repeat.status, 0)
+    assert.strictEqual(JSON.parse(fs.readFileSync(path.join(report, 'manifest.json'), 'utf8')).completed, 3)
+  })
+
   it('uses the selected command and maps project headers and shared-brace branches to original lines', () => {
     writeDb(argv)
     const ambiguous = cli()
@@ -104,7 +130,7 @@ describe('compiler-configured dumpAST', function () {
 
   it('records diagnostics, #line presumed source and direct cc flags', () => {
     fs.writeFileSync(source, '#warning test-warning\n#line 77 "logical.c"\nint mapped(void) { return 1; }\n')
-    writeDb([['cc', '-fvisibility=hidden', '-funroll-loops', '-fno-unroll-loops', '-c', source, '-o', path.join(dir, 'would-be-output.o')]])
+    writeDb([['cc', '-W', '-fvisibility=hidden', '-funroll-loops', '-fno-unroll-loops', '-c', source, '-o', path.join(dir, 'would-be-output.o')]])
     const result = cli()
     assert.strictEqual(result.status, 0, result.stderr)
     const ast = JSON.parse(fs.readFileSync(report, 'utf8'))

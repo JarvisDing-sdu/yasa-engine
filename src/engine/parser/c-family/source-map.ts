@@ -19,6 +19,17 @@ export interface SourceSegment {
  * @param cwd
  * @returns {{text: string, sourceMap: SourceSegment[]}} Decoded text and provenance segments.
  */
+function decodeMarkerFilename(encoded: string): string {
+  const chunks: Buffer[] = []
+  for (const match of encoded.matchAll(/\\(?:[0-7]{1,3}|.)|[^\\]+/g)) {
+    const token = match[0]
+    if (/^\\[0-7]/.test(token)) chunks.push(Buffer.from([parseInt(token.slice(1), 8)]))
+    else if (token === '\\\\' || token === '\\"') chunks.push(Buffer.from(token.slice(1)))
+    else chunks.push(Buffer.from(token))
+  }
+  return Buffer.concat(chunks).toString('utf8')
+}
+
 export function decodeLineMarkers(raw: string, cwd: string): { text: string; sourceMap: SourceSegment[] } {
   const lines = raw.split('\n')
   const sourceMap: SourceSegment[] = []
@@ -29,7 +40,7 @@ export function decodeLineMarkers(raw: string, cwd: string): { text: string; sou
     const marker = /^#\s+(\d+)\s+"((?:\\.|[^"\\])*)"(.*)$/.exec(lines[index])
     if (!marker) continue
     if (current) current.generatedEndLine = index
-    const filename: string = JSON.parse(`"${marker[2]}"`)
+    const filename: string = decodeMarkerFilename(marker[2])
     const flags = marker[3].trim().split(/\s+/)
     const virtual = filename.startsWith('<')
     const file = virtual ? filename : path.resolve(cwd, filename)

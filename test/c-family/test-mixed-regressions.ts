@@ -29,7 +29,7 @@ describe('mixed scanner review regressions', function () {
       const input: any = example
       fs.writeFileSync(source, example.code)
       if (input.header) fs.writeFileSync(path.join(root, 'input.h'), input.header)
-      const args = [input.cpp ? '/usr/bin/clang++' : '/usr/bin/clang', input.cpp ? '-std=c++17' : '-std=c17', ...example.flags, source, ...(input.after || []), '-c', '-o', path.join(root, 'main.o')]
+      const args = [input.cpp ? 'clang++' : 'clang', input.cpp ? '-std=c++17' : '-std=c17', ...example.flags, source, ...(input.after || []), '-c', '-o', path.join(root, 'main.o')]
       const compiled = spawnSync(args[0], args.slice(1), { cwd: root, encoding: 'utf8' })
       assert.strictEqual(compiled.status, 0, compiled.stderr)
       const linked = spawnSync(args[0], [path.join(root, 'main.o'), '-o', path.join(root, 'example')], { encoding: 'utf8' })

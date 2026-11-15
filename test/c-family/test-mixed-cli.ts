@@ -102,7 +102,7 @@ function prepareAll(): void {
         const directory = path.resolve(source)
         const cpp = file.endsWith('.cpp')
         const object = path.join(build, `${index}.o`)
-        const argv = [cpp ? '/usr/bin/clang++' : '/usr/bin/clang', cpp ? '-std=c++17' : '-std=c17', '-c', sourceFile, '-o', object]
+        const argv = [cpp ? 'clang++' : 'clang', cpp ? '-std=c++17' : '-std=c17', '-c', sourceFile, '-o', object]
         // This ID is independently calculated from the public database contract.
         const entryId = identity([directory, sourceFile, argv])
         selected.push({ entryId, unitId: identity([GOLD.profileId, program.domainId, entryId]), domainId: program.domainId, sourceFile })
@@ -113,7 +113,7 @@ function prepareAll(): void {
         objects.push(object)
       }
       const executable = path.join(build, 'fixture-program')
-      const link = ['/usr/bin/clang++', ...objects, '-o', executable]
+      const link = ['clang++', ...objects, '-o', executable]
       checkedProcess(link[0], link.slice(1), source)
       assert.ok(fs.statSync(executable).size > 0)
       proof.push({ goldName: gold.goldName, domainId: program.domainId, stage: 'link', argv: link, exitCode: 0 })

@@ -65,7 +65,15 @@ function bindCompilerSymbols(
     if (node.type === 'Identifier' && loc?.start) {
       const isDeclaration =
         (parent?.type === 'FunctionDefinition' || parent?.type === 'VariableDeclaration') && parent.id === node
-      const symbol = (isDeclaration ? definitions : references).get(position(loc.start))
+      // Native AST IDs distinguish template instantiations sharing one source
+      // range. Tree-sitter identifiers continue to use compiler token positions.
+      let symbol = symbols.get(node._meta?.clangDeclarationId) ||
+        (isDeclaration ? definitions : references).get(position(loc.start))
+      const candidates = node._meta?.clangCandidates
+      if (!symbol && Array.isArray(candidates) && candidates.length) {
+        const resolved = candidates.map((candidate: any) => symbols.get(candidate.id))
+        if (resolved.every(Boolean) && new Set(resolved.map(candidate => candidate?.key)).size === 1) symbol = resolved[0]
+      }
       if (symbol) {
         node.name = symbol.key
         node._meta = {
@@ -131,17 +139,14 @@ function collectDiagnostics(
  */
 export async function parsePreparedUnit(
   prepared: CompilerPreparedUnit,
-  symbols: Map<string, FamilySymbol>
+  symbols: Map<string, FamilySymbol>,
+  backend: 'tree-sitter' | 'clang' = 'tree-sitter'
 ): Promise<FamilyParsedUnit> {
   const { context } = prepared
   const moduleFile = path.join(prepared.directory, context.unitId + (context.language === 'cpp' ? '.cpp' : '.c'))
   const result: FamilyParsedUnit = { prepared, ast: null, status: 'failed', diagnostics: [], moduleFile }
   if (prepared.status !== 'prepared') return result
   try {
-    const { Parser } =
-      context.language === 'cpp' ? require('@ant-yasa/uast-parser-cpp') : require('@ant-yasa/uast-parser-c')
-    const parser = new Parser()
-    await parser.init()
     const raw = fs.readFileSync(
       path.join(prepared.directory, context.language === 'cpp' ? 'unit.ii' : 'unit.i'),
       'utf8'
@@ -154,10 +159,19 @@ export async function parsePreparedUnit(
       text = text.slice(0, begin) + raw.slice(begin, end) + text.slice(end)
     }
     result.diagnostics.push(...prepared.diagnostics)
-    const ast = parser.parsePreprocessed(text, {
-      sourcefile: moduleFile,
-      languageVersion: context.standard || undefined,
-    })
+    let ast: any
+    if (backend === 'clang') {
+      ast = await require('./clang-uast').convertClangAstFile(path.join(prepared.directory, 'compiler-ast.json'), {
+        raw, sourceMap: prepared.sourceMap, sourcefile: moduleFile, originalSourcefile: context.sourceFile,
+        language: context.language, languageVersion: context.standard || undefined, retainedRanges: prepared.libraryBodies,
+        validated: true,
+      })
+    } else {
+      const { Parser } = require('@ant-yasa/uast-parser-cpp')
+      const parser = new Parser({ language: context.language })
+      await parser.init()
+      ast = parser.parsePreprocessed(text, { sourcefile: moduleFile, languageVersion: context.standard || undefined })
+    }
     bindCompilerSymbols(ast, prepared, symbols, coordinates)
     const { processParsedAst } = require('../parser-core')
     result.ast = processParsedAst(
@@ -201,13 +215,14 @@ export async function parsePreparedUnit(
       for (const [key, value] of Object.entries(node)) if (!['parent', 'loc', '_meta'].includes(key)) map(value)
     }
     map(result.ast)
-    result.diagnostics.push(...collectDiagnostics(prepared, coordinates, ast))
+    if (backend === 'clang') {
+      for (const [kind, count] of Object.entries(ast._meta.clangBackend.unsupported))
+        result.diagnostics.push({ code: 'clang_conversion_partial', message: `${kind}: ${count}` })
+    } else result.diagnostics.push(...collectDiagnostics(prepared, coordinates, ast))
     result.status = result.diagnostics.length ? 'partial' : 'parsed'
     fs.writeFileSync(path.join(prepared.directory, 'project.txt'), text)
-    fs.writeFileSync(
-      path.join(prepared.directory, 'uast.json'),
-      JSON.stringify(ast, (key, value) => (key === 'parent' ? undefined : value))
-    )
+    fs.writeFileSync(path.join(prepared.directory, 'uast.json'),
+      require('../../../util/deep-json').stringifyJsonWithFallback(ast, (key: string, value: any) => key === 'parent' ? undefined : value))
   } catch (error: any) {
     result.diagnostics.push({ code: 'parse_failed', message: String(error.message) })
   }
