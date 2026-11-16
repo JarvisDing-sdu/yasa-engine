@@ -20,6 +20,7 @@ const { foldConstant } = require('./c-const-eval')
 const { CTypeIndex } = require('./c-types')
 const { CCallbackIndex } = require('./c-callbacks')
 const Scope = require('../../common/scope')
+const { lodashCloneWithTag } = require('../../../../util/clone-util')
 
 const {
   valueUtil: {
@@ -153,6 +154,8 @@ function containsLabel(node: any, labels: Set<string>): boolean {
  * 以便跨文件调用无需解析 #include。
  */
 class CAnalyzer extends Analyzer {
+  private lambdaCaptureSequence = 0
+
   /** 文件名 → 模块 scope */
   private moduleScopes = new Map<string, any>()
 
@@ -404,6 +407,16 @@ class CAnalyzer extends Analyzer {
    * @returns 函数值
    */
   override processFunctionDefinition(scope: any, node: any, state: any): any {
+    if (node._meta?.cppLambda?.captureSemantics === 'scalar_snapshot') {
+      const position = node.loc?.start
+      const captured = Scope.createSubScope(`<capture_${position?.line}_${position?.column}_${++this.lambdaCaptureSequence}>`, scope, 'scope')
+      for (const binding of node._meta.cppLambda.captures || []) {
+        const value = this.processInstruction(scope, binding.value, state)
+        captured.setMemberValue(binding.name, lodashCloneWithTag(value))
+      }
+      return super.processFunctionDefinition(captured, node, state)
+    }
+
     const name = node?.id?.name
     const previous = scope?.isCModule && name && node.body ? scope.getMemberValue?.(name) : undefined
     const fclos = super.processFunctionDefinition(scope, node, state)
@@ -1021,6 +1034,30 @@ class CAnalyzer extends Analyzer {
    * @returns 语句结果
    */
   override processSwitchStatement(scope: any, node: any, state: any): any {
+    // Only select a branch for literal integer discriminants. General constant
+    // folding can erase side effects or target-dependent casts.
+    const literalInteger = (expression: any): number | undefined => {
+      if (expression?.type === 'Literal' && Number.isSafeInteger(expression.value)) return expression.value
+      if (expression?.type === 'UnaryExpression' && ['+', '-'].includes(expression.operator)) {
+        const value = literalInteger(expression.argument)
+        return value === undefined ? undefined : expression.operator === '-' ? -value : value
+      }
+      return undefined
+    }
+    const selected = literalInteger(node.discriminant)
+    const clauses = node.cases || []
+    if (selected !== undefined && clauses.every((c: any) => !c.test || literalInteger(c.test) !== undefined) &&
+        clauses.every((c: any) => !c._meta?.clangCaseRange || c._meta.clangCaseRange.expanded)) {
+      let index = clauses.findIndex((c: any) => c.test && literalInteger(c.test) === selected)
+      if (index < 0) index = clauses.findIndex((c: any) => !c.test)
+      if (index < 0) return new UndefinedValue()
+      const result = this.processInstruction(scope, clauses.slice(index).map((c: any) => c.body), state)
+      if (this.flow.dead && this.flow.reasons.size === 1 && this.flow.reasons.has('break')) {
+        this.flow.dead = false
+        this.flow.reasons.clear()
+      }
+      return result
+    }
     const results: BranchResult[] = []
     const cases = (node.cases || []).map((c: any) => ({ ...c, body: this.branch(c.body, results) }))
     const ret = super.processSwitchStatement(scope, { ...node, cases }, state)

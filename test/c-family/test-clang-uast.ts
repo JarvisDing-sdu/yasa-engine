@@ -44,6 +44,25 @@ describe('experimental Clang AST to UAST', function () {
   })
   after(() => fs.rmSync(directory, { recursive: true, force: true }))
 
+  it('preserves calls inside dependent pack expansion patterns without claiming complete semantics', () => {
+    const source = path.join(directory, 'pack-pattern.cpp')
+    fs.writeFileSync(source, `int transform(int); template<class... T> int sink(T...);
+      template<class... T> int apply(T... values){return sink(transform(values)...);}`)
+    const database = source + '.compile.json', report = source + '.json'
+    fs.writeFileSync(database, JSON.stringify([{ directory, file: source, arguments: ['clang++', '-std=c++17', '-c', source] }]))
+    const child = spawnSync(process.execPath, ['--import', 'tsx', 'src/main.ts', '--sourcePath', source,
+      '--language', 'cpp', '--dumpAST', '--cCompileCommands', database, '--cAstBackend', 'clang', '--report', report], { cwd: engine, encoding: 'utf8' })
+    assert.strictEqual(child.status, 0, child.stdout + child.stderr)
+    const ast = JSON.parse(fs.readFileSync(report, 'utf8'))
+    const packs = walk(ast, 'SpreadElement')
+    assert.strictEqual(packs.length, 1)
+    assert.strictEqual(packs[0].argument.type, 'CallExpression')
+    assert.strictEqual(packs[0].argument.callee.name, 'transform')
+    assert.strictEqual(packs[0]._meta.clangPackExpansion.instantiated, false)
+    assert.strictEqual(ast._meta.clangBackend.unsupported.PackExpansionExpr, 1)
+    assert.strictEqual(ast._meta.clangBackend.status, 'partial')
+  })
+
   it('preserves C functions, macro calls and original source lines', () => {
     const ast = asts.get('c')
     assert.strictEqual(ast.language, 'c')
@@ -108,7 +127,7 @@ describe('experimental Clang AST to UAST', function () {
 
   it('retains generic lambda bodies and records capture and instantiation limits', () => {
     for (const [name, expression, issue] of [
-      ['capture', '[value](int input){ return input + value; }', 'lambda_capture_semantics'],
+      ['capture', '[copy=value](int input){ return input + copy; }', 'lambda_capture_semantics'],
       ['generic', '[](auto input){ return input + 1; }', 'generic_lambda_instantiation'],
     ]) {
       const source = path.join(directory, name + '.cpp')
@@ -299,6 +318,149 @@ describe('experimental Clang AST to UAST', function () {
     assert.ok(walk(cleanup, 'NewExpression').length > 0)
     assert.strictEqual(ast._meta.clangBackend.unsupported.cpp_statement_expression_lifetime, 4)
     assert.ok(!ast._meta.clangBackend.unsupported.StmtExpr)
+  })
+
+  it('fills scalar and nested array tails without unbounded expansion', () => {
+    const converter = new ClangUastConverter({ sourcefile: 'arrays.c', language: 'c', raw: '', sourceMap: [] })
+    const zero = (type: string) => ({ kind: 'ImplicitValueInitExpr', type: { qualType: type } })
+    const make = (type: string, filler: any, values: any[]) => converter.visit({ kind: 'InitListExpr', type: { qualType: type }, array_filler: [filler, ...values] })
+    const a = make('int[4]', zero('int'), [{ kind: 'IntegerLiteral', value: '7' }])
+    assert.deepStrictEqual(a.properties.map((p: any) => p.value.value), [7, 0, 0, 0])
+    const pointer = make('int *[2]', zero('int *'), [])
+    assert.ok(pointer.properties.every((p: any) => p.value.value === null))
+    const arrayPointers = make('int (*[2])[3]', zero('int (*)[3]'), [])
+    assert.ok(arrayPointers.properties.every((p: any) => p.value.value === null))
+    const matrix = make('int[2][3]', zero('int[3]'), [])
+    assert.strictEqual(matrix.properties.length, 2)
+    assert.ok(matrix.properties.every((p: any) => p.value.properties.length === 3))
+    assert.ok(!converter.finish()._meta.clangBackend.unsupported.implicit_array_tail)
+    const large = make('int[1000000]', zero('int'), [])
+    assert.strictEqual(large.properties.length, 0)
+    assert.strictEqual(converter.finish()._meta.clangBackend.unsupported.implicit_array_tail, 1)
+    const records = make('struct S[2]', zero('struct S'), [])
+    assert.strictEqual(records.properties.length, 0)
+    assert.strictEqual(converter.finish()._meta.clangBackend.unsupported.implicit_array_tail, 2)
+  })
+
+  it('lowers simple backward branches and preserves switch condition scope', () => {
+    const source = path.join(directory, 'control-gaps.c')
+    fs.writeFileSync(source, `int input(void); int step(int);
+      int loop(int n){again: n=step(n); if(n>0) goto again; return n;}
+      int selection(int x){switch(x){int x; case 1: x=input(); return x; default:return 0;}}
+      int unsafe(int n){start: if(n--) goto start; return n;}
+      int incoming(int n){if(n)goto again; again:n--;if(n>0)goto again;return n;}
+      int unreachable(int n){switch(n){int x=input();case 1:return x;default:return 0;}}
+      int arrays(void){int a[4]={1};int b[2][3]={{2}};return a[3]+b[1][2];}`)
+    const database = source + '.compile.json', report = source + '.json'
+    fs.writeFileSync(database, JSON.stringify([{ directory, file: source, arguments: ['clang', '-c', source] }]))
+    const child = spawnSync(process.execPath, ['--import', 'tsx', 'src/main.ts', '--sourcePath', source,
+      '--language', 'c', '--dumpAST', '--cCompileCommands', database, '--cAstBackend', 'clang', '--report', report], { cwd: engine, encoding: 'utf8' })
+    assert.strictEqual(child.status, 0, child.stdout + child.stderr)
+    const ast = JSON.parse(fs.readFileSync(report, 'utf8'))
+    const fn = (name: string) => walk(ast, 'FunctionDefinition').find(node => node.id.name === name)
+    const loop = walk(fn('loop'), 'WhileStatement')[0]
+    assert.ok(loop?.isPostTest)
+    assert.strictEqual(walk(loop, 'CallExpression').filter(call => call.callee.name === 'step').length, 1)
+    assert.strictEqual(walk(fn('incoming'), 'WhileStatement').length, 0)
+    const selection = fn('selection'), sw = walk(selection, 'SwitchStatement')[0]
+    assert.ok(sw._meta.clangSwitchDeclarations)
+    const declarations = walk(selection, 'VariableDeclaration').filter(node => !node._meta?.isParameter)
+    assert.strictEqual(declarations[0].init.name, 'x')
+    assert.strictEqual(declarations[1].id.name, 'x')
+    assert.strictEqual(declarations[1].init, null)
+    assert.strictEqual(ast._meta.clangBackend.unsupported.goto_control_flow, 2)
+    assert.strictEqual(ast._meta.clangBackend.unsupported.switch_pre_label_statement, 1)
+    assert.ok(!ast._meta.clangBackend.unsupported.implicit_array_tail)
+  })
+
+  it('retains case clauses wrapped by ordinary labels and fills typedef array tails', () => {
+    const source = path.join(directory, 'labelled-cases.c')
+    fs.writeFileSync(source, `typedef long long Counter; typedef int *Pointer;
+      int target(int); int inspect(int n){switch(n){outer:inner:case 0:case 2:target(n);break;case 1:goto outer;last:default:break;}return n;}
+      struct Stats {Counter current[10];Counter peak[10];};
+      struct Stats stats={{0},{0}};
+      Pointer pointers[2]={0};`)
+    const database = source + '.compile.json', report = source + '.json'
+    fs.writeFileSync(database, JSON.stringify([{ directory, file: source, arguments: ['clang', '-c', source] }]))
+    const child = spawnSync(process.execPath, ['--import', 'tsx', 'src/main.ts', '--sourcePath', source,
+      '--language', 'c', '--dumpAST', '--cCompileCommands', database, '--cAstBackend', 'clang', '--report', report], { cwd: engine, encoding: 'utf8' })
+    assert.strictEqual(child.status, 0, child.stdout + child.stderr)
+    const ast = JSON.parse(fs.readFileSync(report, 'utf8'))
+    const sw = walk(ast, 'SwitchStatement')[0]
+    assert.strictEqual(sw.cases.length, 4)
+    assert.deepStrictEqual(walk(sw, 'LabeledStatement').map(node => node.label.name), ['outer', 'inner', 'last'])
+    assert.strictEqual(walk(sw, 'CallExpression').filter(node => node.callee.name === 'target').length, 1)
+    assert.strictEqual(sw.cases[0].test.value, 0)
+    assert.strictEqual(sw.cases[1].test.value, 2)
+    const stats = walk(ast, 'VariableDeclaration').find(node => node.id.name === 'stats')
+    for (const field of stats.init.properties) {
+      assert.strictEqual(field.value.properties.length, 10)
+      assert.ok(field.value.properties.every((item: any) => item.value.value === 0))
+    }
+    const pointers = walk(ast, 'VariableDeclaration').find(node => node.id.name === 'pointers')
+    assert.strictEqual(pointers.init.properties.length, 2)
+    assert.strictEqual(pointers.init.properties[1].value.value, null)
+    assert.ok(!ast._meta.clangBackend.unsupported.implicit_array_tail)
+    assert.ok(!ast._meta.clangBackend.unsupported.switch_pre_label_statement)
+    assert.strictEqual(ast._meta.clangBackend.unsupported.goto_control_flow, 1)
+  })
+
+  it('expands bounded GNU case ranges and retains unsupported nested label bodies', () => {
+    const source = path.join(directory, 'switch-ranges.c')
+    fs.writeFileSync(source, `int target(int); int range(int n){switch(n){case -2 ... 2:return target(n);default:return 0;}}
+      int large(int n){switch(n){case 0 ... 10000:return target(n);default:return 0;}}
+      int nested(int n){switch(n){case 0:{int local=3;case 1:return target(local);}default:return 0;}}`)
+    const database = source + '.compile.json', report = source + '.json'
+    fs.writeFileSync(database, JSON.stringify([{ directory, file: source, arguments: ['clang', '-c', source] }]))
+    const child = spawnSync(process.execPath, ['--import', 'tsx', 'src/main.ts', '--sourcePath', source,
+      '--language', 'c', '--dumpAST', '--cCompileCommands', database, '--cAstBackend', 'clang', '--report', report], { cwd: engine, encoding: 'utf8' })
+    assert.strictEqual(child.status, 0, child.stdout + child.stderr)
+    const ast = JSON.parse(fs.readFileSync(report, 'utf8'))
+    const range = walk(ast, 'FunctionDefinition').find(fn => fn.id?.name === 'range')
+    assert.deepStrictEqual(walk(range, 'CaseClause').map(clause => clause.test?.value), [-2, -1, 0, 1, 2, undefined])
+    assert.strictEqual(walk(ast, 'CallExpression').filter(call => call.callee.name === 'target').length, 3)
+    assert.strictEqual(ast._meta.clangBackend.unsupported.case_range_control_flow, 1)
+    assert.strictEqual(ast._meta.clangBackend.unsupported.nested_switch_label_control_flow, 1)
+    assert.ok(!ast._meta.clangBackend.unsupported.CaseStmt)
+  })
+
+  it('retains compiler-validated wide enumerator values without inventing dependent constants', () => {
+    const source = path.join(directory, 'wide-enumerators.cpp')
+    fs.writeFileSync(source, `enum Pixels { RGB=1, BGR=2, MASK=0xffff0000U, RGB2BGR=RGB|(BGR<<16), NEXT };
+      enum class Narrow : unsigned char { Wrapped=(unsigned char)300 };
+      enum class Huge : unsigned long long { Value=18446744073709551615ULL };
+      template<int N> struct Dependent { enum { value=N+1 }; };
+      unsigned read(){return RGB2BGR;}`)
+    const database = source + '.compile.json', report = source + '.json'
+    fs.writeFileSync(database, JSON.stringify([{ directory, file: source, arguments: ['clang++', '-std=c++17', '-c', source] }]))
+    const child = spawnSync(process.execPath, ['--import', 'tsx', 'src/main.ts', '--sourcePath', source,
+      '--language', 'cpp', '--dumpAST', '--cCompileCommands', database, '--cAstBackend', 'clang', '--report', report], { cwd: engine, encoding: 'utf8' })
+    assert.strictEqual(child.status, 0, child.stdout + child.stderr)
+    const ast = JSON.parse(fs.readFileSync(report, 'utf8'))
+    const variables = walk(ast, 'VariableDeclaration')
+    for (const [name, value] of [['MASK', 4294901760], ['RGB2BGR', 131073], ['NEXT', 131074], ['Wrapped', 44], ['Value', '18446744073709551615']]) {
+      assert.strictEqual(variables.find(node => node.id.name === name)?.init.value, value, String(name))
+    }
+    assert.strictEqual(ast._meta.clangBackend.unsupported.dependent_enum_value, 1)
+  })
+
+  it('models scalar value captures and simple inheritance while keeping complex cases partial', () => {
+    const source = path.join(directory, 'capture-inheritance.cpp')
+    fs.writeFileSync(source, `struct Base {int value;}; struct Derived:Base {}; struct Virtual:virtual Base {}; struct Hidden:Base {int value;}; struct Other {int other;}; struct Multiple:Base,Other {}; struct Chain:Virtual {};
+      int f(int value){auto copy=[value](){return value;}; value=0;return copy();}`)
+    const database = source + '.compile.json', report = source + '.json'
+    fs.writeFileSync(database, JSON.stringify([{ directory, file: source, arguments: ['clang++', '-std=c++17', '-c', source] }]))
+    const child = spawnSync(process.execPath, ['--import', 'tsx', 'src/main.ts', '--sourcePath', source,
+      '--language', 'cpp', '--dumpAST', '--cCompileCommands', database, '--cAstBackend', 'clang', '--report', report], { cwd: engine, encoding: 'utf8' })
+    assert.strictEqual(child.status, 0, child.stdout + child.stderr)
+    const ast = JSON.parse(fs.readFileSync(report, 'utf8'))
+    const derived = walk(ast, 'ClassDefinition').find(node => node.id.name === 'Derived')
+    assert.strictEqual(derived.supers[0].name, 'Base')
+    const lambda = walk(ast, 'FunctionDefinition').find(node => node._meta.cppLambda)
+    assert.strictEqual(lambda._meta.cppLambda.captureSemantics, 'scalar_snapshot')
+    assert.deepStrictEqual(lambda._meta.cppLambda.captures.map((capture: any) => capture.name), ['value'])
+    assert.strictEqual(ast._meta.clangBackend.unsupported.cpp_baseclass_semantics, 4)
+    assert.ok(!ast._meta.clangBackend.unsupported.lambda_capture_semantics)
   })
 
   it('exports member-pointer operands and records unresolved member-pointer semantics', () => {

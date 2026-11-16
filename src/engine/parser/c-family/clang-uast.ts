@@ -21,11 +21,14 @@ export interface ClangUastOptions {
 }
 
 export class ClangUastConverter {
+  private implicitArrayBudget = 4096
+  private caseRangeBudget = 4096
   private readonly coordinates: RawCoordinates
   private readonly bytes: Buffer
   private readonly unsupported = new Map<string, number>()
   private readonly body: any[] = []
   private readonly recordFields = new Map<string, string[]>()
+  private readonly recordMembers = new Map<string, Set<string>>()
   private readonly enumValues = new Map<string, string>()
   private readonly labels = new Map<string, string>()
   private readonly records = new Map<string, { ast: any; scopes: string[] }>()
@@ -172,6 +175,37 @@ export class ClangUastConverter {
     return result
   }
 
+  private lowerSimpleBackedges(body: Ast): Ast {
+    if (this.options.language !== 'c' || body.kind !== 'CompoundStmt') return body
+    const top = [...(body.inner || [])]
+    const nodes = (roots: Ast[]): Ast[] => {
+      const pending = [...roots], result: Ast[] = []
+      while (pending.length) { const node = pending.pop()!; result.push(node); pending.push(...(node.inner || [])) }
+      return result
+    }
+    const all = nodes([body])
+    for (let index = 0; index < top.length; index++) {
+      const label = top[index]
+      if (label.kind !== 'LabelStmt' || !label.declId || !label.inner?.[0]) continue
+      if (all.filter(node => node.kind === 'GotoStmt' && node.targetLabelDeclId === label.declId).length !== 1) continue
+      for (let end = index + 1; end < top.length; end++) {
+        const branch = top[end], parts = branch.inner || []
+        const jump = parts[1]?.kind === 'CompoundStmt' && parts[1].inner?.length === 1 ? parts[1].inner[0] : parts[1]
+        if (branch.kind !== 'IfStmt' || branch.hasElse || parts.length !== 2 || jump?.kind !== 'GotoStmt' || jump.targetLabelDeclId !== label.declId) continue
+        const statements = [label.inner[0], ...top.slice(index + 1, end)]
+        if (nodes([...statements, parts[0]]).some(node => ['VarDecl', 'LabelStmt', 'GotoStmt', 'IndirectGotoStmt', 'AddrLabelExpr', 'BreakStmt', 'ContinueStmt', 'CaseStmt', 'DefaultStmt'].includes(node.kind || ''))) continue
+        // With one backedge, no other entry and no scope/control transfers,
+        // this region is exactly a post-test loop. General goto remains partial.
+        if (all.some(node => node.kind === 'AddrLabelExpr' || node.kind === 'IndirectGotoStmt')) continue
+        const range = { begin: label.range?.begin, end: branch.range?.end }
+        top.splice(index, end - index + 1, { kind: 'DoStmt', range, yasaBackedge: label.name,
+          inner: [{ kind: 'CompoundStmt', range, inner: statements }, parts[0]] })
+        break
+      }
+    }
+    return { ...body, inner: top }
+  }
+
   private function(node: Ast, context: Context): any {
     const children = node.inner || []
     const previous = this.parameterDefaults.get(node.previousDecl)
@@ -201,7 +235,7 @@ export class ClangUastConverter {
     const trailingReturn = functionType.lastIndexOf(' -> ')
     const returnType = node.kind === 'CXXConstructorDecl' || node.kind === 'CXXDestructorDecl'
       ? 'void' : trailingReturn >= 0 ? functionType.slice(trailingReturn + 4) : functionType.split(' (')[0]
-    let functionBody = this.statement(body, { ...context, inFunction: true })
+    let functionBody = this.statement(this.lowerSimpleBackedges(body), { ...context, inFunction: true })
     const initializers = children.filter(child => child.kind === 'CXXCtorInitializer')
     if (initializers.length) {
       const statements = initializers.map(initializer => {
@@ -266,7 +300,21 @@ export class ClangUastConverter {
     result._meta.qualifiedName = [...context.scopes, name].join('::')
     if (node.bases?.length) {
       result._meta.clangBases = node.bases.map((base: any) => ({ type: base.type?.qualType, access: base.access, isVirtual: base.isVirtual }))
-      this.unsupported.set('cpp_baseclass_semantics', (this.unsupported.get('cpp_baseclass_semantics') || 0) + 1)
+      const base = node.bases[0]
+      const baseType = (base.type?.desugaredQualType || base.type?.qualType || '').replace(/^(?:struct|class)\s+/, '')
+      const candidates = [...context.scopes.map((_, i) => context.scopes.slice(0, context.scopes.length - i).join('::') + '::' + baseType), baseType]
+      const known = candidates.find(name => this.recordMembers.has(name))
+      const members = (node.inner || []).filter(child => ['FieldDecl', 'CXXMethodDecl'].includes(child.kind || '')).map(child => child.name)
+      const hidesMember = known && members.some(name => name && this.recordMembers.get(known)!.has(name))
+      if (node.bases.length === 1 && !base.isVirtual && known && !hidesMember && !context.inFunction) {
+        result.supers = [this.identifier(known, node)]
+        result._meta.clangInheritance = 'single_nonvirtual'
+      } else this.unsupported.set('cpp_baseclass_semantics', (this.unsupported.get('cpp_baseclass_semantics') || 0) + 1)
+    }
+    const members = new Set<string>((node.inner || []).filter(child => ['FieldDecl', 'CXXMethodDecl'].includes(child.kind || '') && child.name).map(child => child.name!))
+    if (!node.bases?.length || result._meta.clangInheritance) {
+      for (const base of result.supers) for (const member of this.recordMembers.get(base.name) || []) members.add(member)
+      this.recordMembers.set([...context.scopes, name].join('::'), members)
     }
     return result
   }
@@ -278,12 +326,27 @@ export class ClangUastConverter {
       if (node.value === false || node.value === 'false') return 0n
       return /^-?\d+$/.test(String(node.value)) ? BigInt(node.value) : undefined
     }
+    if (['ConstantExpr', 'ParenExpr'].includes(node.kind || '') && node.inner?.length === 1) return this.enumConstant(node.inner[0])
+    if (node.kind === 'UnaryOperator' && ['+', '-'].includes(node.opcode) && node.inner?.length === 1 &&
+        /^(?:int|long|long long)$/.test(node.type?.qualType || '') && node.inner[0].kind === 'IntegerLiteral') {
+      const value = this.enumConstant(node.inner[0])
+      if (value !== undefined) return node.opcode === '-' ? -value : value
+    }
     if (node.kind !== 'ImplicitCastExpr' || node.inner?.length !== 1) return undefined
     const value = this.enumConstant(node.inner[0])
     if (value === undefined) return undefined
     if (node.castKind === 'IntegralToBoolean') return value === 0n ? 0n : 1n
     if (node.castKind !== 'IntegralCast') return undefined
     const type = node.type?.desugaredQualType || node.type?.qualType || ''
+    const sourceType = node.inner[0].type?.desugaredQualType || node.inner[0].type?.qualType || ''
+    const ranks: Record<string, number> = { 'signed char': 1, 'unsigned char': 1, short: 2, 'unsigned short': 2,
+      int: 3, 'unsigned int': 3, long: 4, 'unsigned long': 4, 'long long': 5, 'unsigned long long': 5 }
+    // A compiler-folded signed source value fits the corresponding unsigned
+    // type when nonnegative; same-signedness non-narrowing conversions also
+    // preserve it. This avoids assuming that the compilation target has 32-bit int.
+    const sourceRank = ranks[sourceType], targetRank = ranks[type]
+    if (sourceRank && targetRank >= sourceRank &&
+        (type.startsWith('unsigned ') ? value >= 0n : !sourceType.startsWith('unsigned '))) return value
     // Only unwrap value-preserving casts within the target's guaranteed range.
     // Larger or implementation-dependent conversions retain a coverage diagnostic.
     const widths: Record<string, number> = { 'signed char': 8, 'unsigned char': 8, short: 16, 'unsigned short': 16,
@@ -317,7 +380,7 @@ export class ClangUastConverter {
 
   private initializer(node: Ast, context: Context): any {
     const spelling = node.type?.desugaredQualType || node.type?.qualType || ''
-    const array = /\[(\d+)\]$/.exec(spelling)
+    const array = /\[(\d+)\]/.exec(spelling)
     const fields = node.field?.name ? [node.field.name] : this.recordFields.get(spelling.replace(/^(?:(?:const|volatile|restrict)\s+)*/, '').replace(/^(?:struct|class|union)\s+/, ''))
     const values = node.array_filler ? node.array_filler.slice(1) : node.inner || []
     const properties = values.map((child: Ast, index: number) => UAST.objectProperty(
@@ -328,7 +391,18 @@ export class ClangUastConverter {
     if (array) result._meta.isArray = true
     if (node.array_filler?.[0]) {
       result._meta.clangArrayDefault = this.expression(node.array_filler[0], context)
-      if (array && values.length < Number(array[1])) this.unsupported.set('implicit_array_tail', (this.unsupported.get('implicit_array_tail') || 0) + 1)
+      if (array && values.length < Number(array[1])) {
+        const missing = Number(array[1]) - values.length
+        const element = String(node.array_filler[0].type?.desugaredQualType || node.array_filler[0].type?.qualType || '').replace(/\[\d+\]/g, '').trim()
+        const scalar = /\*/.test(element) || /^(?:(?:const|volatile|restrict|signed|unsigned)\s+)*(?:char|short|int|long|long long|long double|float|double|bool|_Bool)(?: int)?$/.test(element)
+        if (scalar && missing <= this.implicitArrayBudget) {
+          this.implicitArrayBudget -= missing
+          for (let index = values.length; index < Number(array[1]); index++) {
+            properties.push(UAST.objectProperty(UAST.literal(index, 'number'), this.expression(node.array_filler[0], context)))
+          }
+          result._meta.clangArrayFilled = missing
+        } else this.unsupported.set('implicit_array_tail', (this.unsupported.get('implicit_array_tail') || 0) + 1)
+      }
     }
     return result
   }
@@ -339,19 +413,75 @@ export class ClangUastConverter {
     const condition = children.pop()
     const clauses: any[] = []
     let current: any
+    const prefix: Ast[] = []
+    for (const statement of body?.inner || []) {
+      if (statement.kind === 'CaseStmt' || statement.kind === 'DefaultStmt') break
+      prefix.push(statement)
+    }
+    const hoist = this.options.language === 'c' && prefix.length > 0 && prefix.every(statement => statement.kind === 'DeclStmt' &&
+      statement.inner?.every(decl => decl.kind === 'VarDecl' && !decl.init &&
+        !(decl.inner || []).some(child => !child.kind?.endsWith('Attr'))))
+    const declarations: any[] = []
     const append = (statement: Ast): void => {
+      // An ordinary label may wrap a case/default label. It does not make
+      // that case or its following statements a pre-switch unreachable prefix.
+      const labels: Ast[] = []
+      let labelled = statement
+      while (labelled.kind === 'LabelStmt' && labelled.inner?.[0]) {
+        labels.push(labelled)
+        labelled = labelled.inner[0]
+      }
+      if (labels.length && (labelled.kind === 'CaseStmt' || labelled.kind === 'DefaultStmt')) {
+        const first = clauses.length
+        append(labelled)
+        if (clauses[first]) {
+          let marker: any = this.attach(UAST.noop(), labels.at(-1)!)
+          for (const label of [...labels].reverse()) {
+            marker = this.attach(UAST.labeledStatement(this.identifier(label.name || '_', label), marker), label)
+          }
+          clauses[first].body.body.unshift(marker)
+        }
+        return
+      }
       if (statement.kind === 'CaseStmt' || statement.kind === 'DefaultStmt') {
-        if (statement.isGNURange) { this.unsupportedNode(statement); return }
         const parts = statement.inner || []
         current = this.attach(UAST.caseClause(statement.kind === 'CaseStmt' ? this.expression(parts[0], context) : null, UAST.scopedStatement([])), statement)
+        if (statement.isGNURange) {
+          const low = this.enumConstant(parts[0]), high = this.enumConstant(parts[1])
+          if (low !== undefined && high !== undefined && high >= low && high - low < 256n && Number(high - low + 1n) <= this.caseRangeBudget) {
+            this.caseRangeBudget -= Number(high - low + 1n)
+            for (let value = low; value <= high; value++) {
+              const numeric = Number(value)
+              current = this.attach(UAST.caseClause(this.attach(UAST.literal(Number.isSafeInteger(numeric) ? numeric : value.toString(), 'number'), parts[0]), UAST.scopedStatement([])), statement)
+              current._meta.clangCaseRange = { low: low.toString(), high: high.toString(), expanded: true }
+              clauses.push(current)
+            }
+          } else {
+            current._meta.clangCaseRange = { upper: this.expression(parts[1], context), expanded: false }
+            this.unsupported.set('case_range_control_flow', (this.unsupported.get('case_range_control_flow') || 0) + 1)
+            clauses.push(current)
+          }
+          if (parts[2]) append(parts[2])
+          return
+        }
         clauses.push(current)
         const next = statement.kind === 'CaseStmt' ? parts[1] : parts[0]
         if (next) append(next)
       } else if (current) current.body.body.push(this.statement(statement, context))
+      else if (hoist) declarations.push(...this.flatten([this.visit(statement, context)]))
       else this.unsupported.set('switch_pre_label_statement', (this.unsupported.get('switch_pre_label_statement') || 0) + 1)
     }
     for (const statement of body?.inner || []) append(statement)
     const result = this.attach(UAST.switchStatement(this.expression(condition, context), clauses), node)
+    if (hoist) {
+      let name = '__yasa_switch_value_' + (this.begins(node) ?? 0)
+      while (this.options.raw.includes(name)) name += '_'
+      const temporary = this.identifier(name, condition!)
+      const saved = this.attach(UAST.variableDeclaration(temporary, result.discriminant, false, this.type(condition?.type?.qualType)), condition!)
+      result.discriminant = this.identifier(name, condition!)
+      result._meta.clangSwitchDeclarations = true
+      return this.attach(UAST.scopedStatement([...children.map(child => this.statement(child, context)), saved, ...declarations, result]), node)
+    }
     return children.length ? this.attach(UAST.scopedStatement([...children.map(child => this.statement(child, context)), result]), node) : result
   }
 
@@ -395,8 +525,21 @@ export class ClangUastConverter {
       const simpleReferences = /^\[\s*(?:&|&\s*\w+(?:\s*,\s*&\s*\w+)*)\s*\]/.test(this.text(node)) &&
         fields.length === captures.length && fields.every(field => /&$/.test(field.type?.qualType || '')) &&
         captures.every(capture => capture.kind === 'DeclRefExpr')
+      const scalar = (spelling: string) => /^(?:(?:const|volatile|signed|unsigned)\s+)*(?:char|short|int|long|long long|long double|float|double|bool)(?: int)?$/.test(spelling)
+      const references = captures.map(capture => {
+        let value = capture
+        while (value.kind === 'ImplicitCastExpr' && value.inner?.length === 1) value = value.inner[0]
+        return value.kind === 'DeclRefExpr' ? value.referencedDecl : undefined
+      })
+      const simpleValues = /^\[\s*(?:=|[a-zA-Z_]\w*(?:\s*,\s*[a-zA-Z_]\w*)*)\s*\]/.test(this.text(node)) &&
+        fields.length === captures.length && fields.every(field => scalar(field.type?.desugaredQualType || field.type?.qualType || '')) &&
+        references.every(reference => reference?.name && reference.name !== 'this')
       if (simpleReferences) result._meta.cppLambda.captureSemantics = 'lexical_reference'
-      else this.unsupported.set('lambda_capture_semantics', (this.unsupported.get('lambda_capture_semantics') || 0) + 1)
+      else if (simpleValues) {
+        result._meta.cppLambda.captureSemantics = 'scalar_snapshot'
+        result._meta.cppLambda.captures = references.map((reference, index) => ({ name: reference!.name,
+          value: result._meta.clangCaptureInitializers[index] }))
+      } else this.unsupported.set('lambda_capture_semantics', (this.unsupported.get('lambda_capture_semantics') || 0) + 1)
     }
     return this.attach(result, node)
   }
@@ -526,7 +669,10 @@ export class ClangUastConverter {
       }
       case 'ImplicitValueInitExpr':
       case 'CXXScalarValueInitExpr': {
-        const type = node.type?.qualType || ''
+        const type = node.type?.desugaredQualType || node.type?.qualType || ''
+        if (/\[\d+\]/.test(type) && !/\([^)]*\*[^)]*\)\s*\[/.test(type)) return this.initializer({ ...node, kind: 'InitListExpr', array_filler: [
+          { ...node, kind: 'ImplicitValueInitExpr', type: { qualType: type.replace(/\[\d+\]/, '') } },
+        ] }, context)
         return this.attach(/\*/.test(type) ? UAST.literal(null, 'null') : /bool/.test(type) ? UAST.literal(false, 'boolean') : UAST.literal(0, 'number'), node)
       }
       case 'UnresolvedLookupExpr':
@@ -654,6 +800,15 @@ export class ClangUastConverter {
         return this.attach(result, node)
       }
       case 'ConditionalOperator': return this.attach(UAST.conditionalExpression(this.expression(children[0], context), this.expression(children[1], context), this.expression(children[2], context)), node)
+      case 'PackExpansionExpr': {
+        if (children.length !== 1) return this.unsupportedNode(node)
+        const result: any = this.attach(UAST.spreadElement(this.expression(children[0], context)), node)
+        result._meta.clangPackExpansion = { instantiated: false, expansionCount: node.numExpansions ?? null }
+        // Preserve the pattern without pretending a dependent pack is one call
+        // or that its cardinality and evaluation have already been resolved.
+        this.unsupported.set('PackExpansionExpr', (this.unsupported.get('PackExpansionExpr') || 0) + 1)
+        return result
+      }
       case 'CallExpr':
       case 'CXXMemberCallExpr': return this.attach(UAST.callExpression(this.expression(children[0], context), this.arguments(children.slice(1), context, this.calleeReference(children[0]).id || '')), node)
       case 'CXXOperatorCallExpr': {
@@ -701,6 +856,19 @@ export class ClangUastConverter {
         const result = this.attach(UAST.ifStatement(this.expression(condition, context), this.statement(consequent, context), alternative ? this.statement(alternative, context) : null), node)
         return parts.length ? this.attach(UAST.scopedStatement([...this.flatten(parts.map(child => this.statement(child, context))), result]), node) : result
       }
+      case 'CaseStmt':
+      case 'DefaultStmt': {
+        // Labels nested inside a compound statement cannot be flattened without
+        // changing scope and dispatch. Retain the subtree and report that gap.
+        let name = '__yasa_nested_case_' + (this.begins(node) ?? 0)
+        while (this.options.raw.includes(name)) name += '_'
+        const result: any = this.attach(UAST.labeledStatement(this.identifier(name, node), this.statement(children.at(-1), context)), node)
+        result._meta.clangCaseTest = node.kind === 'CaseStmt' ? this.expression(children[0], context) : null
+        if (node.isGNURange) result._meta.clangCaseRange = { upper: this.expression(children[1], context), expanded: false }
+        result._meta.clangNestedSwitchLabel = true
+        this.unsupported.set('nested_switch_label_control_flow', (this.unsupported.get('nested_switch_label_control_flow') || 0) + 1)
+        return result
+      }
       case 'SwitchStmt': return this.switch(node, context)
       case 'CXXForRangeStmt': return this.range(node, context)
       case 'CXXTryStmt': return this.attach(UAST.tryStatement(this.statement(children[0], context), children.slice(1).map(child => this.visit(child, context))), node)
@@ -717,7 +885,11 @@ export class ClangUastConverter {
         const test = declarations.length ? UAST.sequence([...this.flatten(declarations), condition]) : condition
         return this.attach(UAST.whileStatement(test, this.statement(children.at(-1), context), false), node)
       }
-      case 'DoStmt': return this.attach(UAST.whileStatement(this.expression(children[1], context), this.statement(children[0], context), true), node)
+      case 'DoStmt': {
+        const result: any = this.attach(UAST.whileStatement(this.expression(children[1], context), this.statement(children[0], context), true), node)
+        if (node.yasaBackedge) result._meta.clangStructuredBackedge = node.yasaBackedge
+        return result
+      }
       case 'ForStmt': {
         const condition = children[2]?.kind ? this.expression(children[2], context) : null
         const test = children[1]?.kind ? UAST.sequence([...this.flatten([this.visit(children[1], context)]), condition]) : condition
@@ -732,6 +904,13 @@ export class ClangUastConverter {
         const alias: any = this.attach(UAST.noop(), node)
         alias._meta.typedef = { name: node.name, type: this.type(node.type?.desugaredQualType || node.type?.qualType) }
         return alias
+      }
+      case 'NamespaceAliasDecl': {
+        const result: any = this.attach(UAST.noop(), node)
+        // Clang references carry their resolved declaration IDs; aliases have no
+        // runtime operation, but keep the source-level relationship for consumers.
+        result._meta.clangNamespaceAlias = { name: node.name, target: node.aliasedNamespace }
+        return result
       }
       case 'UsingDecl':
       case 'UsingDirectiveDecl':

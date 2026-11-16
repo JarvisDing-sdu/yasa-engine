@@ -102,6 +102,97 @@ describe('Engine consumption of Clang-produced UAST', function () {
     }
   })
 
+  it('analyzes lowered backedges, zero-filled arrays and switch-local declarations', () => {
+    for (const [name, body, expected] of [
+      ['backedge', 'char *value="safe"; again: value=getenv("USER"); if(0)goto again; return system(value);', true],
+      ['array-zero', 'char *values[2]={getenv("USER")}; return system(values[1]);', false],
+      ['array-explicit', 'char *values[2]={getenv("USER")}; return system(values[0]);', true],
+      ['switch-shadow', 'int value=1; switch(value){char *value;case 1:value=getenv("USER");return system(value);default:return 0;}', true],
+    ] as const) {
+      const { sarif } = scan(name, `#include <stdlib.h>
+int main(void){${body}}`, false)
+      assert.strictEqual(sarif.runs[0].results.length > 0, expected, name)
+    }
+  })
+
+  it('executes expanded GNU case ranges with ordinary fallthrough', () => {
+    for (const [value, expected] of [[-3, false], [-2, true], [0, true], [2, true], [3, false]] as const) {
+      const { sarif } = scan('case-range-' + value, `#include <stdlib.h>
+        int main(){char *value="safe";switch(${value}){case -2 ... 2:value=getenv("USER");break;default:break;}return system(value);}`, false)
+      assert.strictEqual(sarif.runs[0].results.length > 0, expected, String(value))
+    }
+  })
+
+  it('selects a literal switch case before default and preserves fallthrough', () => {
+    for (const [name, body, expected] of [
+      ['default-first', 'switch(1){default:value=getenv("USER");break;case 1:break;}', false],
+      ['fallthrough', 'switch(1){case 1:;case 2:value=getenv("USER");break;default:break;}', true],
+    ] as const) {
+      const { sarif } = scan(name, `#include <stdlib.h>
+        int main(){char *value="safe";${body}return system(value);}`, false)
+      assert.strictEqual(sarif.runs[0].results.length > 0, expected, name)
+    }
+  })
+
+  it('snapshots scalar captures at closure creation and isolates mutable captures', () => {
+    const control = scan('snapshot-control', '#include <stdlib.h>\nint main(){int value=(int)(long)getenv("USER");return system((char*)(long)value);}', true)
+    assert.ok(control.sarif.runs[0].results.length > 0, 'scalar control must retain taint')
+    for (const [name, initial, later, expected] of [
+      ['snapshot-positive', '(int)(long)getenv("USER")', '0', true],
+      ['snapshot-negative', '0', '(int)(long)getenv("USER")', false],
+    ] as const) {
+      const { sarif } = scan(name, `#include <stdlib.h>
+        int main(){int value=${initial};auto copy=[value](){return value;};value=${later};return system((char*)(long)copy());}`, true)
+      assert.strictEqual(sarif.runs[0].results.length > 0, expected, name)
+    }
+    const { sarif } = scan('mutable-snapshot', `#include <stdlib.h>
+      int main(){int value=(int)(long)getenv("USER");auto copy=[value]()mutable{value=0;return value;};copy();return system((char*)(long)value);}`, true)
+    assert.ok(sarif.runs[0].results.length > 0)
+  })
+
+  it('keeps separate scalar snapshots from repeated closure creation', () => {
+    for (const [name, first, second, expected] of [
+      ['factory-positive', '(int)(long)getenv("USER")', '0', true],
+      ['factory-negative', '0', '(int)(long)getenv("USER")', false],
+    ] as const) {
+      const { sarif } = scan(name, `#include <stdlib.h>
+        auto make(int value){return [value](){return value;};}
+        int main(){auto first=make(${first});auto second=make(${second});second();return system((char*)(long)first());}`, true)
+      assert.strictEqual(sarif.runs[0].results.length > 0, expected, name)
+    }
+  })
+
+  it('resolves namespace aliases by declaration identity across lexical scopes', () => {
+    const { graph } = scan('namespace-aliases', `
+      namespace one {int first(){return 1;}}
+      namespace two {int second(){return 2;}}
+      namespace alias=one; namespace chained=alias;
+      int outer(){return chained::first();}
+      namespace nested {namespace alias=two;int inner(){return alias::second();}}
+      int main(){return outer()+nested::inner();}`, true)
+    const pairs = new Set(Object.values<any>(graph.edges).map(edge =>
+      `${graph.nodes[edge.sourceNodeId].funcDef?.name}->${graph.nodes[edge.targetNodeId].funcDef?.name}`))
+    assert.ok(pairs.has('outer->one::first'), [...pairs].join(', '))
+    assert.ok(pairs.has('nested::inner->two::second'), [...pairs].join(', '))
+    assert.ok(!pairs.has('nested::inner->one::first'))
+  })
+
+  it('resolves a single base inside a namespace without confusing same-named records', () => {
+    const { sarif } = scan('namespaced-base', `#include <stdlib.h>
+      struct Base {int unrelated;};
+      namespace model {struct Base {char *value;char *get(){return value;}};struct Derived:Base {};}
+      int main(){model::Derived d;d.value=getenv("USER");return system(d.get());}`, true)
+    assert.ok(sarif.runs[0].results.length > 0)
+  })
+
+  it('uses inherited instance fields through a nonvirtual single base', () => {
+    const { sarif } = scan('single-base', `#include <stdlib.h>
+      struct Base {char *value;char *get(){return value;}};
+      struct Derived:Base {};
+      int main(){Derived d;d.value=getenv("USER");return system(d.get());}`, true)
+    assert.ok(sarif.runs[0].results.length > 0)
+  })
+
   it('preserves forward goto state when it bypasses assignments', () => {
     for (const [name, initial, skipped, expected] of [
       ['goto-positive', 'getenv("USER")', '"safe"', true],
