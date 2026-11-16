@@ -78,6 +78,30 @@ describe('Engine consumption of Clang-produced UAST', function () {
     assert.ok(Object.values<any>(graph.nodes).some(node => node.funcDef?.name === 'get'))
   })
 
+  it('tracks values through designated compound literals', () => {
+    for (const [name, value, expected] of [
+      ['compound-positive', 'getenv("USER")', true],
+      ['compound-negative', '"safe"', false],
+    ] as const) {
+      const { sarif } = scan(name, `extern char *getenv(const char *); extern int system(const char *);
+        struct Value { int tag; char *text; };
+        int main(void) { return system(((struct Value){.text=${value}, .tag=2}).text); }`, false)
+      assert.strictEqual(sarif.runs.some((run: any) => run.results?.length > 0), expected)
+    }
+  })
+
+  it('preserves statement-expression results, side effects and local shadowing', () => {
+    for (const [name, body, expected] of [
+      ['statement-result', 'return system(({ char *local=getenv("USER"); local; }));', true],
+      ['statement-shadow', 'char *value="safe"; ({ char *value=getenv("USER"); value; }); return system(value);', false],
+      ['statement-write', 'char *value="safe"; ({ value=getenv("USER"); 0; }); return system(value);', true],
+    ] as const) {
+      const { sarif } = scan(name, `extern char *getenv(const char *); extern int system(const char *);
+        int main(void) { ${body} }`, false)
+      assert.strictEqual(sarif.runs.some((run: any) => run.results?.length > 0), expected, name)
+    }
+  })
+
   it('preserves forward goto state when it bypasses assignments', () => {
     for (const [name, initial, skipped, expected] of [
       ['goto-positive', 'getenv("USER")', '"safe"', true],
@@ -100,6 +124,16 @@ describe('Engine consumption of Clang-produced UAST', function () {
     assert.ok(sarif.runs.some((run: any) => run.results?.length > 0))
     const pairs = Object.values<any>(graph.edges).map(edge => graph.nodes[edge.sourceNodeId].funcDef?.name + '->' + graph.nodes[edge.targetNodeId].funcDef?.name)
     assert.ok(pairs.includes('main->input'), JSON.stringify(pairs))
+  })
+
+  it('evaluates alias constructor defaults at the caller', () => {
+    const { graph } = scan('initializer-operands', `
+      int target(int x){return x;}
+      struct Box { Box(int x=target(3)){} }; using Alias=Box;
+      int main(){ Alias value; return 0; }
+    `, true)
+    const pairs = Object.values<any>(graph.edges).map(edge => graph.nodes[edge.sourceNodeId].funcDef?.name + '->' + graph.nodes[edge.targetNodeId].funcDef?.name)
+    assert.ok(pairs.includes('main->target'), JSON.stringify(pairs))
   })
 
   it('uses explicit arguments without evaluating the default source', () => {

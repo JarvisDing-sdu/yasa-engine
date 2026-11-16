@@ -127,7 +127,7 @@ export class ClangUastConverter {
   }
 
   private flatten(nodes: any[]): any[] {
-    return nodes.flatMap(node => !node ? [] : node.type === 'Sequence' ? this.flatten(node.expressions) : [node])
+    return nodes.flatMap(node => !node ? [] : node.type === 'Sequence' && !node._meta?.gnuStatementExpression ? this.flatten(node.expressions) : [node])
   }
 
   private declarations(nodes: Ast[], context: Context): any[] {
@@ -271,11 +271,35 @@ export class ClangUastConverter {
     return result
   }
 
+  private enumConstant(node: Ast | undefined): bigint | undefined {
+    if (!node) return undefined
+    if (node.value !== undefined) {
+      if (node.value === true || node.value === 'true') return 1n
+      if (node.value === false || node.value === 'false') return 0n
+      return /^-?\d+$/.test(String(node.value)) ? BigInt(node.value) : undefined
+    }
+    if (node.kind !== 'ImplicitCastExpr' || node.inner?.length !== 1) return undefined
+    const value = this.enumConstant(node.inner[0])
+    if (value === undefined) return undefined
+    if (node.castKind === 'IntegralToBoolean') return value === 0n ? 0n : 1n
+    if (node.castKind !== 'IntegralCast') return undefined
+    const type = node.type?.desugaredQualType || node.type?.qualType || ''
+    // Only unwrap value-preserving casts within the target's guaranteed range.
+    // Larger or implementation-dependent conversions retain a coverage diagnostic.
+    const widths: Record<string, number> = { 'signed char': 8, 'unsigned char': 8, short: 16, 'unsigned short': 16,
+      int: 16, 'unsigned int': 16, long: 32, 'unsigned long': 32, 'long long': 64, 'unsigned long long': 64 }
+    const width = widths[type]
+    if (!width) return undefined
+    const unsigned = type.startsWith('unsigned ')
+    const limit = 1n << BigInt(width - (unsigned ? 0 : 1))
+    return value >= (unsigned ? 0n : -limit) && value < limit ? value : undefined
+  }
+
   private enumeration(node: Ast, context: Context): any {
     let next: bigint | undefined = 0n
     const declarations = (node.inner || []).filter(child => child.kind === 'EnumConstantDecl').map(child => {
       const expression = child.inner?.[0]
-      const value = expression?.value !== undefined ? BigInt(expression.value === true || expression.value === 'true' ? 1 : expression.value === false || expression.value === 'false' ? 0 : expression.value) : expression ? undefined : next
+      const value = expression ? this.enumConstant(expression) : next
       next = value === undefined ? undefined : value + 1n
       if (child.id && value !== undefined) this.enumValues.set(child.id, value.toString())
       const numeric = Number(value)
@@ -395,7 +419,7 @@ export class ClangUastConverter {
   private arguments(nodes: Ast[], context: Context, key: string, parameterOffset = 0): any[] {
     const arguments_: any[] = []
     for (const [index, node] of nodes.entries()) {
-      if (node.kind === 'CXXDefaultArgExpr') {
+      if (node.kind === 'CXXDefaultArgExpr' && !node.inner?.length) {
         arguments_.push(this.attach(UAST.noop(), node))
         this.pendingDefaults.push({ arguments: arguments_, index, key, context, parameterIndex: index + parameterOffset })
       } else arguments_.push(this.expression(node, context))
@@ -434,6 +458,72 @@ export class ClangUastConverter {
         return selected?.inner?.length ? this.expression(selected.inner.at(-1), context) : this.unsupportedNode(node)
       }
       case 'InitListExpr': return this.initializer(node, context)
+      case 'CXXDefaultArgExpr': return children[0] ? this.expression(children[0], context) : this.unsupportedNode(node)
+      case 'CXXStdInitializerListExpr': {
+        const result: any = this.attach(UAST.castExpression(this.expression(children[0], context), this.type(node.type?.qualType)), node)
+        result._meta.clangStdInitializerList = true
+        this.unsupported.set('initializer_list_object_semantics', (this.unsupported.get('initializer_list_object_semantics') || 0) + 1)
+        return result
+      }
+      case 'ParenListExpr': {
+        const result: any = this.attach(UAST.tupleExpression(children.map(child => this.expression(child, context))), node)
+        result._meta.clangParenthesizedInitializer = true
+        this.unsupported.set('dependent_parenthesized_initialization', (this.unsupported.get('dependent_parenthesized_initialization') || 0) + 1)
+        return result
+      }
+
+      case 'TypeTraitExpr': {
+        if (this.options.language !== 'c' || !this.text(node).startsWith('__builtin_types_compatible_p')) return this.unsupportedNode(node)
+        const result: any = this.attach(UAST.callExpression(this.identifier('__builtin_types_compatible_p', node), []), node)
+        result._meta.typeArguments = children.map(child => this.type(child.type?.desugaredQualType || child.type?.qualType))
+        return result
+      }
+      case 'AtomicExpr': {
+        // Clang groups atomic operands by semantic role, not by source argument order.
+        // This adapter consumes preprocessed text; distinct operand ranges recover the
+        // original argument positions without imposing a runtime evaluation order.
+        const operands = children.map(child => ({ child, offset: this.begins(child) }))
+        const ordered = operands.length > 0 && operands.every(operand => operand.offset !== undefined) &&
+          new Set(operands.map(operand => operand.offset)).size === operands.length
+        const name = node.name || /^\s*(__[a-zA-Z0-9_]*atomic[a-zA-Z0-9_]*)\s*\(/.exec(this.text(node))?.[1]
+        if (ordered) operands.sort((left, right) => left.offset! - right.offset!)
+        const result: any = this.attach(UAST.callExpression(this.identifier(ordered && name ? name : '__clang_atomic_expr', node),
+          operands.map(operand => this.expression(operand.child, context))), node)
+        result._meta.clangAtomic = { builtin: name, argumentOrder: ordered ? 'source' : 'clang_ast',
+          result: /_fetch_(?:add|sub|and|or|xor|nand|min|max)$/.test(name || '') ? 'previous_value' :
+            /_(?:add|sub|and|or|xor|nand|min|max)_fetch$/.test(name || '') ? 'updated_value' : 'builtin_defined',
+          resultType: node.type?.qualType }
+        this.unsupported.set('atomic_memory_semantics', (this.unsupported.get('atomic_memory_semantics') || 0) + 1)
+        if (!ordered || !name) this.unsupported.set('atomic_operand_mapping', (this.unsupported.get('atomic_operand_mapping') || 0) + 1)
+        return result
+      }
+      case 'StmtExpr': {
+        const result: any = this.attach(UAST.sequence((children[0]?.inner || []).map(child => this.visit(child, context))), node)
+        result._meta.gnuStatementExpression = true
+        result._meta.clangStatementExpression = { scope: 'lexical', resultType: node.type?.qualType,
+          valueCategory: node.valueCategory }
+        if (this.options.language === 'cpp') {
+          this.unsupported.set('cpp_statement_expression_lifetime', (this.unsupported.get('cpp_statement_expression_lifetime') || 0) + 1)
+        }
+        return result
+      }
+      case 'CompoundLiteralExpr': {
+        const result: any = this.attach(UAST.castExpression(this.expression(children[0], context), this.type(node.type?.desugaredQualType || node.type?.qualType)), node)
+        result._meta.compoundLiteral = true
+        return result
+      }
+      case 'VAArgExpr': {
+        const result: any = this.attach(UAST.callExpression(this.identifier('__builtin_va_arg', node), children.map(child => this.expression(child, context))), node)
+        result._meta.typeArguments = [this.type(node.type?.desugaredQualType || node.type?.qualType)]
+        return result
+      }
+      case 'OffsetOfExpr': {
+        const result: any = this.attach(UAST.callExpression(this.identifier('offsetof', node), children.map(child => this.expression(child, context))), node)
+        // Clang omits the field path from JSON. Retain its exact spelling for consumers.
+        result._meta.clangOffsetOf = this.text(node)
+        if (children.length) this.unsupported.set('offsetof_index_evaluation', (this.unsupported.get('offsetof_index_evaluation') || 0) + 1)
+        return result
+      }
       case 'ImplicitValueInitExpr':
       case 'CXXScalarValueInitExpr': {
         const type = node.type?.qualType || ''
@@ -537,9 +627,18 @@ export class ClangUastConverter {
       case 'BinaryOperator':
       case 'CompoundAssignOperator': {
         const left = this.expression(children[0], context), right = this.expression(children[1], context)
+        if (node.opcode === '->*' || node.opcode === '.*') {
+          const member: any = this.attach(UAST.memberAccess(left, right, true), node)
+          member._meta.cppMemberPointer = node.opcode
+          this.unsupported.set('member_pointer_resolution', (this.unsupported.get('member_pointer_resolution') || 0) + 1)
+          return member
+        }
         if (node.opcode === '=' || node.kind === 'CompoundAssignOperator') {
-          if (!UAST.isLVal(left) && left.type !== 'DereferenceExpression') return this.unsupportedNode(node)
-          // The common UAST schema omits dereferences from LVal. Match the C visitor's compatibility representation.
+          const referenceCall = left.type === 'CallExpression' && children[0]?.valueCategory === 'lvalue'
+          if (!UAST.isLVal(left) && left.type !== 'DereferenceExpression' && !referenceCall) return this.unsupportedNode(node)
+          if (referenceCall) this.unsupported.set('assignment_location_semantics', (this.unsupported.get('assignment_location_semantics') || 0) + 1)
+          // Clang lvalues include dereferences and reference-returning calls beyond the shared LVal schema.
+          // Preserve both operands while reporting unresolved write-back semantics for calls.
           const assignment = UAST.assignmentExpression(UAST.identifier('_'), right, node.opcode, false)
           assignment.left = left
           return this.attach(assignment, node)
@@ -591,7 +690,7 @@ export class ClangUastConverter {
       case 'CXXTemporaryObjectExpr': {
         if (node.kind === 'CXXUnresolvedConstructExpr') this.unsupported.set('dependent_construction', (this.unsupported.get('dependent_construction') || 0) + 1)
         const arguments_ = children.flatMap(child => child.kind === 'ParenListExpr' ? child.inner || [] : [child])
-        return this.attach(UAST.newExpression(this.identifier(node.type?.qualType || '_', node), this.arguments(arguments_, context, node.type?.qualType + '|' + node.ctorType?.qualType)), node)
+        return this.attach(UAST.newExpression(this.identifier(node.type?.qualType || '_', node), this.arguments(arguments_, context, (node.type?.desugaredQualType || node.type?.qualType) + '|' + node.ctorType?.qualType)), node)
       }
       case 'LambdaExpr': return this.lambda(node, context)
       case 'IfStmt': {

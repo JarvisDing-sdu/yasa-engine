@@ -128,6 +128,21 @@ describe('compiler-configured dumpAST', function () {
     assert.ok(!fs.existsSync(report))
   })
 
+  it('preserves floating-point and CPU build flags through both AST backends', () => {
+    fs.writeFileSync(source, '#if defined(__FAST_MATH__) && defined(__SSE2__)\nint selected(void){return 1;}\n#else\nint fallback(void){return 0;}\n#endif\n')
+    const flags = ['-ffast-math', '-fvisibility-inlines-hidden', '-msse', '-msse2', '-mrecip=none']
+    writeDb([['clang', ...flags, '-c', source, '-o', path.join(dir, 'unused.o')]])
+    for (const backend of ['tree-sitter', 'clang']) {
+      const result = cli(['--cAstBackend', backend])
+      assert.strictEqual(result.status, 0, result.stderr)
+      const ast = JSON.parse(fs.readFileSync(report, 'utf8'))
+      assert.deepStrictEqual(Object.keys(functions(ast)), ['selected'])
+      for (const flag of flags) assert.ok(ast._meta.compilerDump.argv.includes(flag))
+      assert.ok(!fs.existsSync(path.join(dir, 'unused.o')))
+      fs.unlinkSync(report)
+    }
+  })
+
   it('records diagnostics, #line presumed source and direct cc flags', () => {
     fs.writeFileSync(source, '#warning test-warning\n#line 77 "logical.c"\nint mapped(void) { return 1; }\n')
     writeDb([['cc', '-W', '-fvisibility=hidden', '-funroll-loops', '-fno-unroll-loops', '-c', source, '-o', path.join(dir, 'would-be-output.o')]])

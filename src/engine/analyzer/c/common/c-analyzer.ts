@@ -19,6 +19,7 @@ const StateUtil = require('../../../util/state-util')
 const { foldConstant } = require('./c-const-eval')
 const { CTypeIndex } = require('./c-types')
 const { CCallbackIndex } = require('./c-callbacks')
+const Scope = require('../../common/scope')
 
 const {
   valueUtil: {
@@ -44,7 +45,7 @@ const NUMERIC_CONVERSIONS = new Set([
 ])
 
 /** parser-C 把这些运算符表示为同名 CallExpression */
-const COMPILE_TIME_OPERATORS = new Set(['sizeof', 'alignof', '_Alignof', '__alignof__', 'offsetof'])
+const COMPILE_TIME_OPERATORS = new Set(['sizeof', 'alignof', '_Alignof', '__alignof__', 'offsetof', '__builtin_types_compatible_p'])
 
 /**
  * 数组、struct/union 以及 typedef 名（无法区分时按聚合处理）
@@ -456,6 +457,14 @@ class CAnalyzer extends Analyzer {
         }
       }
     }
+  }
+
+  /** GNU statement expressions yield their last value inside a local block scope. */
+  override processSequence(scope: any, node: any, state: any): any {
+    if (!node._meta?.gnuStatementExpression) return super.processSequence(scope, node, state)
+    const start = node.loc?.start
+    const block = Scope.createSubScope(`<statement_expression_${start?.line}_${start?.column}>`, scope, 'scope')
+    return super.processSequence(block, node, state)
   }
 
   /**

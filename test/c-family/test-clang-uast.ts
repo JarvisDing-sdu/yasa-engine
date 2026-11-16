@@ -172,6 +172,213 @@ describe('experimental Clang AST to UAST', function () {
     assert.strictEqual(walk(walk(ast, 'ThrowStatement')[0], 'CallExpression')[0].callee.name, 'target')
   })
 
+  it('preserves compound literals, variadic operand types and offsetof spelling', () => {
+    const source = path.join(directory, 'c-values.c')
+    fs.writeFileSync(source, `#include <stdarg.h>
+      #include <stddef.h>
+      struct Pair { int first; int second; };
+      int target(int x) { return x; }
+      int compound(int x) { return ((struct Pair){.second=target(x), .first=2}).second; }
+      int variadic(int n, ...) { va_list args; va_start(args,n); int value=va_arg(args,int); va_end(args); return value; }
+      unsigned long offset(void) { return offsetof(struct Pair, second); }
+      enum Flags { first=1L<<0, second=1L<<1, negative=-2L, following };
+      int enum_value(void) { return second; }
+      int statement(int x) { return ({ int value=target(x); value+1; }); }
+      int type_check(void) { return __builtin_types_compatible_p(int, long); }`)
+    const database = path.join(directory, 'c-values.compile.json')
+    fs.writeFileSync(database, JSON.stringify([{ directory, file: source, arguments: ['clang', '-c', source] }]))
+    const report = path.join(directory, 'c-values.json')
+    const child = spawnSync(process.execPath, ['--import', 'tsx', 'src/main.ts', '--sourcePath', source,
+      '--language', 'c', '--dumpAST', '--cCompileCommands', database, '--cAstBackend', 'clang', '--report', report], { cwd: engine, encoding: 'utf8' })
+    assert.strictEqual(child.status, 0, child.stdout + child.stderr)
+    const ast = JSON.parse(fs.readFileSync(report, 'utf8'))
+    assert.strictEqual(ast._meta.clangBackend.status, 'converted', JSON.stringify(ast._meta.clangBackend))
+    const compound = walk(ast, 'CastExpression').find(node => node._meta.compoundLiteral)
+    assert.ok(compound)
+    assert.deepStrictEqual(walk(compound, 'ObjectProperty').map(node => node.key.name), ['first', 'second'])
+    assert.deepStrictEqual(walk(compound, 'CallExpression').map(node => node.callee.name), ['target'])
+    const calls = walk(ast, 'CallExpression')
+    const variadic = calls.find(node => node.callee.name === '__builtin_va_arg')
+    assert.strictEqual(variadic.arguments[0].name, 'args')
+    assert.strictEqual(variadic._meta.typeArguments[0].id.name, 'int')
+    assert.ok(calls.find(node => node.callee.name === 'offsetof')._meta.clangOffsetOf.includes('second'))
+    const flags = walk(ast, 'ClassDefinition').find(node => node.id.name === 'Flags')
+    assert.deepStrictEqual(flags.body.map((node: any) => node.init.value), [1, 2, -2, -1])
+    const read = walk(ast, 'FunctionDefinition').find(node => node.id.name === 'enum_value')
+    assert.strictEqual(walk(read, 'ReturnStatement')[0].argument.value, 2)
+    const statement = walk(ast, 'FunctionDefinition').find(node => node.id.name === 'statement')
+    const sequence = walk(statement, 'Sequence').find(node => node._meta.gnuStatementExpression)
+    assert.ok(sequence)
+    assert.strictEqual(sequence.expressions.at(-1).type, 'BinaryExpression')
+    assert.deepStrictEqual(walk(sequence, 'CallExpression').map(node => node.callee.name), ['target'])
+    const trait = calls.find(node => node.callee.name === '__builtin_types_compatible_p')
+    assert.deepStrictEqual(trait._meta.typeArguments.map((type: any) => type.id.name), ['int', 'long'])
+    assert.deepStrictEqual(trait.arguments, [])
+  })
+
+  for (const language of ['c', 'cpp']) it(`retains atomic builtin operands in source argument order for ${language}`, () => {
+    const source = path.join(directory, 'atomic-operands.' + (language === 'c' ? 'c' : 'cpp'))
+    fs.writeFileSync(source, `int *address(void); int delta(void); int order(void);
+      #define UPDATE(p,d) __atomic_fetch_add(p,d,order())
+      int old_value(void){return UPDATE(address(),delta());}
+      int new_value(void){return __atomic_add_fetch(address(),delta(),5);}
+      int load(void){return __atomic_load_n(address(),2);}
+      void store(void){__atomic_store_n(address(),delta(),3);}
+      int compare(int *expected){return __atomic_compare_exchange_n(address(),expected,delta(),0,5,2);}
+      _Atomic(int) *atomic_address(void);
+      int c11(void){return __c11_atomic_fetch_add(atomic_address(),delta(),4);}`)
+    const database = source + '.compile.json', report = source + '.json'
+    fs.writeFileSync(database, JSON.stringify([{ directory, file: source, arguments: [language === 'c' ? 'clang' : 'clang++', '-c', source] }]))
+    const child = spawnSync(process.execPath, ['--import', 'tsx', 'src/main.ts', '--sourcePath', source,
+      '--language', language, '--dumpAST', '--cCompileCommands', database, '--cAstBackend', 'clang', '--report', report], { cwd: engine, encoding: 'utf8' })
+    assert.strictEqual(child.status, 0, child.stdout + child.stderr)
+    const ast = JSON.parse(fs.readFileSync(report, 'utf8'))
+    const calls = walk(ast, 'CallExpression'), atomic = calls.filter(call => call._meta.clangAtomic)
+    assert.strictEqual(atomic.length, 6)
+    const fetch = atomic.find(call => call.callee.name === '__atomic_fetch_add')
+    assert.deepStrictEqual(fetch.arguments.map((arg: any) => arg.callee.name), ['address', 'delta', 'order'])
+    assert.strictEqual(fetch._meta.clangAtomic.result, 'previous_value')
+    assert.strictEqual(fetch._meta.originalLocation.start.line, 3)
+    const update = atomic.find(call => call.callee.name === '__atomic_add_fetch')
+    assert.strictEqual(update._meta.clangAtomic.result, 'updated_value')
+    assert.strictEqual(update.arguments[2].value, 5)
+    const store = atomic.find(call => call.callee.name === '__atomic_store_n')
+    assert.strictEqual(store.arguments[1].callee.name, 'delta')
+    assert.strictEqual(store.arguments[2].value, 3)
+    const compare = atomic.find(call => call.callee.name === '__atomic_compare_exchange_n')
+    assert.strictEqual(compare.arguments[1].name, 'expected')
+    assert.strictEqual(compare.arguments[2].callee.name, 'delta')
+    assert.deepStrictEqual(compare.arguments.slice(4).map((arg: any) => arg.value), [5, 2])
+    assert.strictEqual(calls.filter(call => call.callee.name === 'address').length, 5)
+    assert.strictEqual(calls.filter(call => call.callee.name === 'delta').length, 5)
+    const c11 = atomic.find(call => call.callee.name === '__c11_atomic_fetch_add')
+    assert.strictEqual(c11.arguments[0].callee.name, 'atomic_address')
+    assert.strictEqual(c11.arguments[1].callee.name, 'delta')
+    assert.strictEqual(c11.arguments[2].value, 4)
+    assert.strictEqual(ast._meta.clangBackend.unsupported.atomic_memory_semantics, 6)
+    assert.ok(!ast._meta.clangBackend.unsupported.AtomicExpr)
+  })
+
+  it('keeps atomic operands with explicit diagnostics when source argument order is unavailable', () => {
+    const converter = new ClangUastConverter({ sourcefile: 'missing.c', language: 'c', raw: '', sourceMap: [] })
+    const call = converter.visit({ kind: 'AtomicExpr', name: '__atomic_fetch_add', inner: [
+      { kind: 'IntegerLiteral', value: '11' }, { kind: 'IntegerLiteral', value: '22' }, { kind: 'IntegerLiteral', value: '33' },
+    ] })
+    assert.strictEqual(call.callee.name, '__clang_atomic_expr')
+    assert.deepStrictEqual(call.arguments.map((arg: any) => arg.value), [11, 22, 33])
+    assert.strictEqual(call._meta.clangAtomic.argumentOrder, 'clang_ast')
+    assert.strictEqual(converter.finish()._meta.clangBackend.unsupported.atomic_operand_mapping, 1)
+  })
+
+  it('retains C++ GNU statement expression scopes, nested values and lifetime boundaries', () => {
+    const source = path.join(directory, 'cpp-statement-expressions.cpp')
+    fs.writeFileSync(source, `int input(); void consume(int);
+      int run(){int value=9; return ({int value=input(); value+=({int value=input();value;}); value;})+value;}
+      void no_result(){({consume(input()); int local=1;});}
+      struct Guard {Guard(); ~Guard(); int value;};
+      int cleanup(){return ({Guard guard; guard.value;});}`)
+    const database = source + '.compile.json', report = source + '.json'
+    fs.writeFileSync(database, JSON.stringify([{ directory, file: source, arguments: ['clang++', '-std=gnu++17', '-c', source] }]))
+    const child = spawnSync(process.execPath, ['--import', 'tsx', 'src/main.ts', '--sourcePath', source,
+      '--language', 'cpp', '--dumpAST', '--cCompileCommands', database, '--cAstBackend', 'clang', '--report', report], { cwd: engine, encoding: 'utf8' })
+    assert.strictEqual(child.status, 0, child.stdout + child.stderr)
+    const ast = JSON.parse(fs.readFileSync(report, 'utf8'))
+    const run = walk(ast, 'FunctionDefinition').find(fn => fn.id.name === 'run')
+    const scopes = walk(run, 'Sequence').filter(node => node._meta.gnuStatementExpression)
+    assert.strictEqual(scopes.length, 2)
+    assert.ok(scopes.every(node => node.expressions.at(-1).name === 'value'))
+    assert.strictEqual(walk(run, 'CallExpression').filter(call => call.callee.name === 'input').length, 2)
+    const sum = walk(run, 'ReturnStatement')[0].argument
+    assert.strictEqual(sum.right.name, 'value')
+    const noResult = walk(ast, 'FunctionDefinition').find(fn => fn.id.name === 'no_result')
+    const block = walk(noResult, 'Sequence').find(node => node._meta.gnuStatementExpression)
+    assert.strictEqual(block._meta.clangStatementExpression.resultType, 'void')
+    assert.ok(walk(block, 'CallExpression').some(call => call.callee.name === 'consume'))
+    const cleanup = walk(ast, 'FunctionDefinition').find(fn => fn.id.name === 'cleanup')
+    assert.ok(walk(cleanup, 'Sequence').some(node => node._meta.gnuStatementExpression))
+    assert.ok(walk(cleanup, 'NewExpression').length > 0)
+    assert.strictEqual(ast._meta.clangBackend.unsupported.cpp_statement_expression_lifetime, 4)
+    assert.ok(!ast._meta.clangBackend.unsupported.StmtExpr)
+  })
+
+  it('exports member-pointer operands and records unresolved member-pointer semantics', () => {
+    const source = path.join(directory, 'member-pointers.cpp')
+    fs.writeFileSync(source, 'struct S { int value; int method(){return value;} }; int read(S *p, int S::*data, int(S::*method)()){return p->*data+(p->*method)();} int object(S s,int S::*data){return s.*data;}')
+    const database = source + '.compile.json'
+    fs.writeFileSync(database, JSON.stringify([{ directory, file: source, arguments: ['clang++', '-std=c++17', '-c', source] }]))
+    const report = source + '.json'
+    const child = spawnSync(process.execPath, ['--import', 'tsx', 'src/main.ts', '--sourcePath', source,
+      '--language', 'cpp', '--dumpAST', '--cCompileCommands', database, '--cAstBackend', 'clang', '--report', report], { cwd: engine, encoding: 'utf8' })
+    assert.strictEqual(child.status, 0, child.stdout + child.stderr)
+    const ast = JSON.parse(fs.readFileSync(report, 'utf8'))
+    assert.strictEqual(ast._meta.compilerDump.status, 'partial_conversion')
+    assert.strictEqual(ast._meta.clangBackend.unsupported.member_pointer_resolution, 3)
+    const accesses = walk(ast, 'MemberAccess').filter(node => node._meta.cppMemberPointer)
+    assert.deepStrictEqual(accesses.map(node => node._meta.cppMemberPointer).sort(), ['->*', '->*', '.*'])
+    assert.ok(accesses.every(node => node.computed))
+    assert.ok(walk(ast, 'CallExpression').some(node => node.callee._meta?.cppMemberPointer === '->*'))
+  })
+
+  it('retains calls in standard initializer lists, alias defaults and dependent parenthesized initialization', () => {
+    const source = path.join(directory, 'initializer-calls.cpp')
+    fs.writeFileSync(source, `#include <initializer_list>
+      int target(int x){return x;}
+      struct Box { Box(int x=target(3)){} }; using Alias=Box;
+      void consume(std::initializer_list<int>);
+      void run(){Alias value; consume({target(1),target(2)});}
+      template<class T> void dependent(){T value(target(4),target(5));}`)
+    const database = source + '.compile.json'
+    fs.writeFileSync(database, JSON.stringify([{ directory, file: source, arguments: ['clang++', '-std=c++17', '-c', source] }]))
+    const report = source + '.json'
+    const child = spawnSync(process.execPath, ['--import', 'tsx', 'src/main.ts', '--sourcePath', source,
+      '--language', 'cpp', '--dumpAST', '--cCompileCommands', database, '--cAstBackend', 'clang', '--report', report], { cwd: engine, encoding: 'utf8' })
+    assert.strictEqual(child.status, 0, child.stdout + child.stderr)
+    const ast = JSON.parse(fs.readFileSync(report, 'utf8'))
+    const run = walk(ast, 'FunctionDefinition').find(fn => fn.id?.name === 'run')
+    assert.deepStrictEqual(walk(run, 'CallExpression').filter(call => call.callee.name === 'target').map(call => call.arguments[0].value).sort(), [1, 2, 3])
+    const list = walk(run, 'CastExpression').find(node => node._meta.clangStdInitializerList)
+    assert.ok(list)
+    assert.strictEqual(walk(list, 'ObjectProperty').length, 2)
+    const dependent = walk(ast, 'FunctionDefinition').find(fn => fn.id?.name === 'dependent')
+    assert.deepStrictEqual(walk(dependent, 'CallExpression').map(call => call.arguments[0].value), [4, 5])
+    assert.ok(ast._meta.clangBackend.unsupported.dependent_parenthesized_initialization)
+    assert.ok(!ast._meta.clangBackend.unsupported.CXXDefaultArgExpr)
+  })
+
+  it('preserves calls on both sides of assignments to reference-returning expressions', () => {
+    const source = path.join(directory, 'reference-assignment.cpp')
+    fs.writeFileSync(source, 'int index(); int input(); struct Array {int &operator[](int);}; int &ref(); void run(Array &array){array[index()]=input();ref()+=input();}')
+    const database = source + '.compile.json'
+    fs.writeFileSync(database, JSON.stringify([{ directory, file: source, arguments: ['clang++', '-std=c++17', '-c', source] }]))
+    const report = source + '.json'
+    const child = spawnSync(process.execPath, ['--import', 'tsx', 'src/main.ts', '--sourcePath', source,
+      '--language', 'cpp', '--dumpAST', '--cCompileCommands', database, '--cAstBackend', 'clang', '--report', report], { cwd: engine, encoding: 'utf8' })
+    assert.strictEqual(child.status, 0, child.stdout + child.stderr)
+    const ast = JSON.parse(fs.readFileSync(report, 'utf8'))
+    const run = walk(ast, 'FunctionDefinition').find(fn => fn.id?.name === 'run')
+    const names = walk(run, 'CallExpression').map(call => call.callee.name)
+    assert.strictEqual(names.filter(name => name === 'input').length, 2)
+    for (const name of ['index', 'ref', 'operator[]']) assert.ok(names.includes(name), name)
+    assert.strictEqual(ast._meta.clangBackend.unsupported.assignment_location_semantics, 2)
+    assert.deepStrictEqual(walk(run, 'AssignmentExpression').map(node => node.operator), ['=', '+='])
+    assert.ok(walk(run, 'AssignmentExpression').every(node => node.left.type === 'CallExpression'))
+  })
+
+  it('keeps offsetof index evaluation visibly partial', () => {
+    const source = path.join(directory, 'indexed-offset.c')
+    fs.writeFileSync(source, '#include <stddef.h>\nstruct Array { int values[8]; }; int index(void); unsigned long offset(void) { return offsetof(struct Array, values[index()]); }')
+    const database = path.join(directory, 'indexed-offset.compile.json')
+    fs.writeFileSync(database, JSON.stringify([{ directory, file: source, arguments: ['clang', '-c', source] }]))
+    const report = path.join(directory, 'indexed-offset.json')
+    const child = spawnSync(process.execPath, ['--import', 'tsx', 'src/main.ts', '--sourcePath', source,
+      '--language', 'c', '--dumpAST', '--cCompileCommands', database, '--cAstBackend', 'clang', '--report', report], { cwd: engine, encoding: 'utf8' })
+    assert.strictEqual(child.status, 0, child.stdout + child.stderr)
+    const ast = JSON.parse(fs.readFileSync(report, 'utf8'))
+    assert.strictEqual(ast._meta.compilerDump.status, 'partial_conversion')
+    assert.strictEqual(ast._meta.clangBackend.unsupported.offsetof_index_evaluation, 1)
+    assert.ok(walk(ast, 'CallExpression').some(call => call.callee.name === 'index'))
+  })
+
   it('retains dependent enum expressions and extended floating values without invented constants', () => {
     const source = path.join(directory, 'dependent-values.cpp')
     fs.writeFileSync(source, 'template<int N> struct Values { enum { value = N + 1, next }; }; long double wide = 1.0e400L; const char32_t packed[] = U"\\x9999999A\\x8000002B"; int throwing(int value) { return value ? value : throw 1; }')
