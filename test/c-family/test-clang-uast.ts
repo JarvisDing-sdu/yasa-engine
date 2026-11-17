@@ -44,6 +44,29 @@ describe('experimental Clang AST to UAST', function () {
   })
   after(() => fs.rmSync(directory, { recursive: true, force: true }))
 
+  it('retains dependent operator assignment operands and their side effects', () => {
+    const source = path.join(directory, 'dependent-assignment.cpp')
+    fs.writeFileSync(source, `struct Number {}; Number operator*(Number, Number); int input();
+      template<class It> void write(It it){*it++=input();}
+      void concrete(int* it){*it++=input();}`)
+    const database = source + '.compile.json', report = source + '.json'
+    fs.writeFileSync(database, JSON.stringify([{ directory, file: source, arguments: ['clang++', '-std=c++17', '-c', source] }]))
+    const child = spawnSync(process.execPath, ['--import', 'tsx', 'src/main.ts', '--sourcePath', source,
+      '--language', 'cpp', '--dumpAST', '--cCompileCommands', database, '--cAstBackend', 'clang', '--report', report], { cwd: engine, encoding: 'utf8' })
+    assert.strictEqual(child.status, 0, child.stdout + child.stderr)
+    const ast = JSON.parse(fs.readFileSync(report, 'utf8'))
+    const assignments = walk(ast, 'AssignmentExpression')
+    assert.strictEqual(assignments.length, 2)
+    const dependent = assignments.find(node => node._meta.clangDependentAssignment)
+    assert.ok(dependent)
+    assert.strictEqual(dependent.left.type, 'CallExpression')
+    assert.strictEqual(dependent.right.callee.name, 'input')
+    assert.strictEqual(walk(dependent.left, 'UnaryExpression').filter(node => node.operator === '++').length, 1)
+    assert.strictEqual(ast._meta.clangBackend.unsupported.dependent_assignment_target, 1)
+    assert.ok(!ast._meta.clangBackend.unsupported.BinaryOperator)
+    assert.strictEqual(ast._meta.clangBackend.status, 'partial')
+  })
+
   it('preserves calls inside dependent pack expansion patterns without claiming complete semantics', () => {
     const source = path.join(directory, 'pack-pattern.cpp')
     fs.writeFileSync(source, `int transform(int); template<class... T> int sink(T...);

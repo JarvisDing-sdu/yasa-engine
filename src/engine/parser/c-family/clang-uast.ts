@@ -781,12 +781,16 @@ export class ClangUastConverter {
         }
         if (node.opcode === '=' || node.kind === 'CompoundAssignOperator') {
           const referenceCall = left.type === 'CallExpression' && children[0]?.valueCategory === 'lvalue'
-          if (!UAST.isLVal(left) && left.type !== 'DereferenceExpression' && !referenceCall) return this.unsupportedNode(node)
+          const dependentTarget = left.type === 'CallExpression' && children[0]?.kind === 'CXXOperatorCallExpr' &&
+            children[0]?.type?.qualType === '<dependent type>'
+          if (!UAST.isLVal(left) && left.type !== 'DereferenceExpression' && !referenceCall && !dependentTarget) return this.unsupportedNode(node)
+          if (dependentTarget) this.unsupported.set('dependent_assignment_target', (this.unsupported.get('dependent_assignment_target') || 0) + 1)
           if (referenceCall) this.unsupported.set('assignment_location_semantics', (this.unsupported.get('assignment_location_semantics') || 0) + 1)
           // Clang lvalues include dereferences and reference-returning calls beyond the shared LVal schema.
           // Preserve both operands while reporting unresolved write-back semantics for calls.
           const assignment = UAST.assignmentExpression(UAST.identifier('_'), right, node.opcode, false)
           assignment.left = left
+          if (dependentTarget) assignment._meta = { ...assignment._meta, clangDependentAssignment: true }
           return this.attach(assignment, node)
         }
         return this.attach(UAST.binaryExpression(node.opcode, left, right), node)
