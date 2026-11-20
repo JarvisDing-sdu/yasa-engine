@@ -25,10 +25,11 @@ function safeArguments(args: string[]): string[] {
     }
     if (/^-(?:D|U|I).+/.test(arg) || /^-(?:isystem|iquote|idirafter|include|imacros).+/.test(arg) ||
         /^(?:--sysroot|--target|--std|-std)=.+/.test(arg) || /^-fvisibility=(?:default|hidden|protected|internal)$/.test(arg) ||
-        /^-f(?:no-)?(?:fast-math|visibility-inlines-hidden)$/.test(arg) ||
-        /^-m(?:no-)?sse(?:2)?$/.test(arg) || arg === '-mrecip=none' ||
-        /^-O(?:[0-3sgz]|fast)?$/.test(arg) || /^-g(?:[0-3])?$/.test(arg) ||
-        /^(?:-W|-pipe|-pthread|-ansi|-pedantic|-pedantic-errors|-fPIC|-fpic|-fPIE|-fpie|-fno-omit-frame-pointer|-fomit-frame-pointer|-fno-common|-fcommon|-funsigned-char|-fsigned-char|-fshort-wchar|-funroll-loops|-fno-unroll-loops)$/.test(arg) ||
+        /^-fdiagnostics-color=(?:always|auto|never)$/.test(arg) ||
+        /^-f(?:no-)?(?:fast-math|visibility-inlines-hidden|strict-aliasing)$/.test(arg) ||
+        /^-m(?:no-)?sse(?:2)?$/.test(arg) || arg === '-mbranches-within-32B-boundaries' || arg === '-mrecip=none' ||
+        arg === '-coverage' || /^-O(?:[0-3sgz]|fast)?$/.test(arg) || /^-g(?:[0-3])?$/.test(arg) ||
+        /^(?:-W|-pipe|-pthread|-ansi|-pedantic|-pedantic-errors|-fPIC|-fpic|-fPIE|-fpie|-fno-omit-frame-pointer|-fomit-frame-pointer|-fno-common|-fcommon|-funsigned-char|-fsigned-char|-fshort-wchar|-funroll-loops|-fno-unroll-loops|-ffunction-sections|-fdata-sections)$/.test(arg) ||
         /^-W(?![pale],)[a-zA-Z0-9_=,+-]+$/.test(arg)) continue
     throw new Error(`Unsupported compiler option in AST export: ${arg}`)
   }

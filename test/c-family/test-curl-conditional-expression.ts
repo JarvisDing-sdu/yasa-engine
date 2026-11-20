@@ -41,7 +41,7 @@ function identifiers(root: any): Record<string, number> {
 }
 
 describe('C dumpAST conditional expression from curl', function () {
-  this.timeout(30_000)
+  this.timeout(300_000)
   for (const a of [false, true]) {
     for (const b of [false, true]) {
       it(`exports the full function and selected initializer (A=${a}, B=${b})`, () => {

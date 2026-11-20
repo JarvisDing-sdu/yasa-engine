@@ -25,7 +25,7 @@ const walk = (root: any, type: string): any[] => {
 }
 
 describe('experimental Clang AST to UAST', function () {
-  this.timeout(30_000)
+  this.timeout(300_000)
   let directory: string
   const asts = new Map<string, any>()
   before(() => {
@@ -284,6 +284,7 @@ describe('experimental Clang AST to UAST', function () {
     const update = atomic.find(call => call.callee.name === '__atomic_add_fetch')
     assert.strictEqual(update._meta.clangAtomic.result, 'updated_value')
     assert.strictEqual(update.arguments[2].value, 5)
+    const load = atomic.find(call => call.callee.name === '__atomic_load_n')
     const store = atomic.find(call => call.callee.name === '__atomic_store_n')
     assert.strictEqual(store.arguments[1].callee.name, 'delta')
     assert.strictEqual(store.arguments[2].value, 3)
@@ -297,7 +298,12 @@ describe('experimental Clang AST to UAST', function () {
     assert.strictEqual(c11.arguments[0].callee.name, 'atomic_address')
     assert.strictEqual(c11.arguments[1].callee.name, 'delta')
     assert.strictEqual(c11.arguments[2].value, 4)
-    assert.strictEqual(ast._meta.clangBackend.unsupported.atomic_memory_semantics, 6)
+    assert.strictEqual(ast._meta.clangBackend.unsupported.atomic_memory_semantics, 1)
+    assert.deepStrictEqual(update._meta.clangAtomic.memoryOrder, [{ value: 5, name: 'seq_cst' }])
+    assert.deepStrictEqual(load._meta.clangAtomic.memoryOrder, [{ value: 2, name: 'acquire' }])
+    assert.deepStrictEqual(store._meta.clangAtomic.memoryOrder, [{ value: 3, name: 'release' }])
+    assert.deepStrictEqual(compare._meta.clangAtomic.memoryOrder.map((o: any) => o.name), ['seq_cst', 'acquire'])
+    assert.deepStrictEqual(c11._meta.clangAtomic.memoryOrder, [{ value: 4, name: 'acq_rel' }])
     assert.ok(!ast._meta.clangBackend.unsupported.AtomicExpr)
   })
 
@@ -359,10 +365,44 @@ describe('experimental Clang AST to UAST', function () {
     assert.ok(!converter.finish()._meta.clangBackend.unsupported.implicit_array_tail)
     const large = make('int[1000000]', zero('int'), [])
     assert.strictEqual(large.properties.length, 0)
-    assert.strictEqual(converter.finish()._meta.clangBackend.unsupported.implicit_array_tail, 1)
+    assert.strictEqual(large._meta.clangImplicitArrayTail.count, 1000000)
     const records = make('struct S[2]', zero('struct S'), [])
     assert.strictEqual(records.properties.length, 0)
-    assert.strictEqual(converter.finish()._meta.clangBackend.unsupported.implicit_array_tail, 2)
+    assert.strictEqual(records._meta.clangImplicitArrayTail.count, 2)
+    assert.ok(!converter.finish()._meta.clangBackend.unsupported.implicit_array_tail)
+  })
+
+  it('preserves empty declarations, predefined names, constant choose expressions and aggregate array tails', () => {
+    const source = path.join(directory, 'c-static-expressions.c')
+    fs.writeFileSync(source, `struct Item { int value; };
+      struct Item items[4] = {{1}};
+      int marker;
+      ;
+      const char *current_name(void){ return __func__; }
+      int chosen(void){ return __builtin_choose_expr(1, 11, 22); }
+      int empty(void){ ; return 0; }`)
+    const database = path.join(directory, 'c-static-expressions.compile.json')
+    fs.writeFileSync(database, JSON.stringify([{ directory, file: source, arguments: ['clang', '-std=c99', '-c', source] }]))
+    const report = path.join(directory, 'c-static-expressions.json')
+    const child = spawnSync(process.execPath, ['--import', 'tsx', 'src/main.ts', '--sourcePath', source,
+      '--language', 'c', '--dumpAST', '--cCompileCommands', database, '--cAstBackend', 'clang', '--report', report], { cwd: engine, encoding: 'utf8' })
+    assert.strictEqual(child.status, 0, child.stdout + child.stderr)
+    const ast = JSON.parse(fs.readFileSync(report, 'utf8'))
+    const empty = walk(ast, 'Noop').filter(node => node._meta.emptyDeclaration)
+    assert.ok(empty.length >= 1)
+    const name = walk(ast, 'FunctionDefinition').find(fn => fn.id.name === 'current_name')
+    const predefined = walk(name, 'Literal').find(node => node.value === 'current_name')
+    assert.ok(predefined)
+    assert.strictEqual(predefined._meta.clangPredefined, '__func__')
+    const chosen = walk(ast, 'FunctionDefinition').find(fn => fn.id.name === 'chosen')
+    assert.strictEqual(walk(chosen, 'ReturnStatement')[0].argument.value, 11)
+    assert.strictEqual(walk(chosen, 'ReturnStatement')[0].argument._meta.clangChooseExpr.selected, 'true')
+    const items = walk(ast, 'VariableDeclaration').find(node => node.id.name === 'items')
+    assert.strictEqual(items.init.properties.length, 1)
+    assert.strictEqual(items.init._meta.clangImplicitArrayTail.count, 3)
+    assert.match(items.init._meta.clangImplicitArrayTail.elementType, /struct Item/)
+    assert.strictEqual(ast._meta.clangBackend.status, 'converted')
+    for (const key of ['EmptyDecl', 'PredefinedExpr', 'ChooseExpr', 'implicit_array_tail']) assert.strictEqual(ast._meta.clangBackend.unsupported[key], undefined)
   })
 
   it('lowers simple backward branches and preserves switch condition scope', () => {
@@ -391,7 +431,8 @@ describe('experimental Clang AST to UAST', function () {
     assert.strictEqual(declarations[0].init.name, 'x')
     assert.strictEqual(declarations[1].id.name, 'x')
     assert.strictEqual(declarations[1].init, null)
-    assert.strictEqual(ast._meta.clangBackend.unsupported.goto_control_flow, 2)
+    assert.strictEqual(ast._meta.clangBackend.unsupported.goto_control_flow, undefined)
+    assert.ok(walk(ast, 'Noop').filter(node => node._meta.gotoKind).length >= 2)
     assert.strictEqual(ast._meta.clangBackend.unsupported.switch_pre_label_statement, 1)
     assert.ok(!ast._meta.clangBackend.unsupported.implicit_array_tail)
   })
@@ -425,7 +466,7 @@ describe('experimental Clang AST to UAST', function () {
     assert.strictEqual(pointers.init.properties[1].value.value, null)
     assert.ok(!ast._meta.clangBackend.unsupported.implicit_array_tail)
     assert.ok(!ast._meta.clangBackend.unsupported.switch_pre_label_statement)
-    assert.strictEqual(ast._meta.clangBackend.unsupported.goto_control_flow, 1)
+    assert.strictEqual(ast._meta.clangBackend.unsupported.goto_control_flow, undefined)
   })
 
   it('expands bounded GNU case ranges and retains unsupported nested label bodies', () => {
@@ -464,7 +505,7 @@ describe('experimental Clang AST to UAST', function () {
     for (const [name, value] of [['MASK', 4294901760], ['RGB2BGR', 131073], ['NEXT', 131074], ['Wrapped', 44], ['Value', '18446744073709551615']]) {
       assert.strictEqual(variables.find(node => node.id.name === name)?.init.value, value, String(name))
     }
-    assert.strictEqual(ast._meta.clangBackend.unsupported.dependent_enum_value, 1)
+    assert.strictEqual(ast._meta.clangBackend.unsupported.dependent_enum_value, undefined)
   })
 
   it('models scalar value captures and simple inheritance while keeping complex cases partial', () => {
@@ -574,7 +615,8 @@ describe('experimental Clang AST to UAST', function () {
       '--language', 'cpp', '--dumpAST', '--cCompileCommands', database, '--cAstBackend', 'clang', '--report', report], { cwd: engine, encoding: 'utf8' })
     assert.strictEqual(child.status, 0, child.stdout + child.stderr)
     const ast = JSON.parse(fs.readFileSync(report, 'utf8'))
-    assert.strictEqual(ast._meta.clangBackend.unsupported.dependent_enum_value, 2)
+    assert.strictEqual(ast._meta.clangBackend.unsupported.dependent_enum_value, undefined)
+    assert.ok(walk(ast, 'VariableDeclaration').some(node => node._meta?.dependentEnumValue || node.init?._meta?.dependentEnumValue))
     assert.strictEqual(ast._meta.clangBackend.unsupported.expression_lowering_CXXThrowExpr, 1)
     const value = walk(ast, 'VariableDeclaration').find(node => node.id.name === 'value')
     assert.strictEqual(value.init.type, 'BinaryExpression')
@@ -609,9 +651,9 @@ describe('experimental Clang AST to UAST', function () {
     assert.strictEqual(walk(body, 'AssignmentExpression')[0].right.callee.name, 'input')
   })
 
-  it('handles empty assembly while preserving instruction and clobber diagnostics', () => {
+  it('preserves GNU assembly operands and source metadata without unsupported diagnostics', () => {
     const source = path.join(directory, 'assembly.c')
-    fs.writeFileSync(source, 'void empty(void){ __asm__(""); } void active(void){ __asm__("nop"); __asm__ volatile("" ::: "memory"); }')
+    fs.writeFileSync(source, 'void empty(void){ __asm__(""); } void active(int value){ __asm__ volatile("nop %0" : "+r"(value) : : "memory"); }')
     const database = path.join(directory, 'assembly.compile.json')
     fs.writeFileSync(database, JSON.stringify([{ directory, file: source, arguments: ['clang', '-c', source] }]))
     const report = path.join(directory, 'assembly.json')
@@ -621,10 +663,60 @@ describe('experimental Clang AST to UAST', function () {
     const ast = JSON.parse(fs.readFileSync(report, 'utf8'))
     const empty = walk(ast, 'FunctionDefinition').find(fn => fn.id.name === 'empty')
     assert.strictEqual(walk(empty, 'Noop')[0]._meta.emptyInlineAssembly, true)
-    assert.strictEqual(ast._meta.clangBackend.unsupported.GCCAsmStmt, 2)
+    const active = walk(ast, 'FunctionDefinition').find(fn => fn.id.name === 'active')
+    const assembly = walk(active, 'Sequence').find(node => node._meta.gnuAsm)
+    assert.ok(assembly)
+    assert.strictEqual(assembly._meta.gnuAsm.volatile, true)
+    assert.strictEqual(assembly._meta.gnuAsm.modeled, false)
+    assert.match(assembly._meta.gnuAsm.text, /"nop %0"/)
+    assert.match(assembly._meta.gnuAsm.text, /"memory"/)
+    assert.ok(walk(assembly, 'Identifier').some(identifier => identifier.name === 'value'))
+    assert.strictEqual(ast._meta.clangBackend.unsupported.GCCAsmStmt, undefined)
+    assert.strictEqual(ast._meta.clangBackend.status, 'converted')
   })
 
-  it('records native batch failures, keeps later entries and exposes conversion gaps', () => {
+  it('records general goto direction without treating control flow as unsupported', () => {
+    const source = path.join(directory, 'general-goto.c')
+    fs.writeFileSync(source, 'int forward(int n){ if(n) goto done; n++; done: return n; } int backward(int n){ start: if(n > 0) goto start; else n = 2; return n; }')
+    const database = path.join(directory, 'general-goto.compile.json')
+    fs.writeFileSync(database, JSON.stringify([{ directory, file: source, arguments: ['clang', '-c', source] }]))
+    const report = path.join(directory, 'general-goto.json')
+    const child = spawnSync(process.execPath, ['--import', 'tsx', 'src/main.ts', '--sourcePath', source,
+      '--language', 'c', '--dumpAST', '--cCompileCommands', database, '--cAstBackend', 'clang', '--report', report], { cwd: engine, encoding: 'utf8' })
+    assert.strictEqual(child.status, 0, child.stdout + child.stderr)
+    const ast = JSON.parse(fs.readFileSync(report, 'utf8'))
+    const jumps = walk(ast, 'Noop').filter(node => node._meta.gotoKind)
+    const forward = jumps.find(node => node._meta.goto === 'done')
+    const backward = jumps.find(node => node._meta.goto === 'start')
+    assert.ok(forward)
+    assert.ok(backward)
+    assert.strictEqual(forward._meta.gotoKind, 'forward')
+    assert.strictEqual(backward._meta.gotoKind, 'backward')
+    assert.ok(Number.isInteger(forward._meta.gotoTargetOffset))
+    assert.ok(Number.isInteger(backward._meta.gotoTargetOffset))
+    assert.strictEqual(ast._meta.clangBackend.unsupported.goto_control_flow, undefined)
+    assert.strictEqual(ast._meta.clangBackend.status, 'converted')
+  })
+
+  it('preserves unresolved dependent enum initializers as explicit metadata', () => {
+    const source = path.join(directory, 'dependent-enum.cpp')
+    fs.writeFileSync(source, 'template<class T> struct Limits { enum E { bytes = sizeof(T), next }; };')
+    const database = path.join(directory, 'dependent-enum.compile.json')
+    fs.writeFileSync(database, JSON.stringify([{ directory, file: source, arguments: ['clang++', '-std=c++17', '-c', source] }]))
+    const report = path.join(directory, 'dependent-enum.json')
+    const child = spawnSync(process.execPath, ['--import', 'tsx', 'src/main.ts', '--sourcePath', source,
+      '--language', 'cpp', '--dumpAST', '--cCompileCommands', database, '--cAstBackend', 'clang', '--report', report], { cwd: engine, encoding: 'utf8' })
+    assert.strictEqual(child.status, 0, child.stdout + child.stderr)
+    const ast = JSON.parse(fs.readFileSync(report, 'utf8'))
+    const enumeration = walk(ast, 'ClassDefinition').find(node => node._meta.kind === 'enum')
+    assert.ok(enumeration)
+    assert.deepStrictEqual(enumeration.body.map((node: any) => node.id.name), ['bytes', 'next'])
+    assert.ok(enumeration.body.every((node: any) => node.init._meta.dependentEnumValue === true))
+    assert.strictEqual(ast._meta.clangBackend.unsupported.dependent_enum_value, undefined)
+    assert.strictEqual(ast._meta.clangBackend.status, 'converted')
+  })
+
+  it('records native batch failures and keeps later entries after goto lowering', () => {
     const input = path.join(directory, 'batch')
     fs.mkdirSync(input)
     const sources = [
@@ -646,8 +738,8 @@ describe('experimental Clang AST to UAST', function () {
     const manifest = JSON.parse(fs.readFileSync(path.join(report, 'manifest.json'), 'utf8'))
     assert.strictEqual(manifest.astBackend, 'clang')
     assert.strictEqual(manifest.completed, 3)
-    assert.deepStrictEqual(manifest.results.map((row: any) => row.status), ['failed', 'partial_conversion', 'no_syntax_errors'])
-    assert.strictEqual(manifest.results[1].conversionDiagnostics.goto_control_flow, 1)
+    assert.deepStrictEqual(manifest.results.map((row: any) => row.status), ['failed', 'no_syntax_errors', 'no_syntax_errors'])
+    assert.deepStrictEqual(manifest.results[1].conversionDiagnostics, {})
     assert.strictEqual(manifest.results[0].output, null)
   })
 

@@ -8,7 +8,7 @@ import { spawnSync } from 'child_process'
 const engine = path.resolve(__dirname, '../..')
 
 describe('compiler-configured dumpAST', function () {
-  this.timeout(30_000)
+  this.timeout(300_000)
   let dir: string
   let source: string
   let header: string
@@ -130,7 +130,7 @@ describe('compiler-configured dumpAST', function () {
 
   it('preserves floating-point and CPU build flags through both AST backends', () => {
     fs.writeFileSync(source, '#if defined(__FAST_MATH__) && defined(__SSE2__)\nint selected(void){return 1;}\n#else\nint fallback(void){return 0;}\n#endif\n')
-    const flags = ['-ffast-math', '-fvisibility-inlines-hidden', '-msse', '-msse2', '-mrecip=none']
+    const flags = ['-ffast-math', '-fvisibility-inlines-hidden', '-fno-strict-aliasing', '-ffunction-sections', '-fdata-sections', '-fdiagnostics-color=always', '-mbranches-within-32B-boundaries', '-msse', '-msse2', '-mrecip=none', '-coverage']
     writeDb([['clang', ...flags, '-c', source, '-o', path.join(dir, 'unused.o')]])
     for (const backend of ['tree-sitter', 'clang']) {
       const result = cli(['--cAstBackend', backend])

@@ -130,7 +130,7 @@ export class ClangUastConverter {
   }
 
   private flatten(nodes: any[]): any[] {
-    return nodes.flatMap(node => !node ? [] : node.type === 'Sequence' && !node._meta?.gnuStatementExpression ? this.flatten(node.expressions) : [node])
+    return nodes.flatMap(node => !node ? [] : node.type === 'Sequence' && !node._meta?.gnuStatementExpression && !node._meta?.gnuAsm ? this.flatten(node.expressions) : [node])
   }
 
   private declarations(nodes: Ast[], context: Context): any[] {
@@ -369,7 +369,10 @@ export class ClangUastConverter {
       let literal: any
       if (value === undefined) {
         literal = expression ? this.expression(expression, context) : this.attach(UAST.noop(), child)
-        this.unsupported.set('dependent_enum_value', (this.unsupported.get('dependent_enum_value') || 0) + 1)
+        // Preserve the unresolved initializer/expression instead of discarding the
+        // enum declaration. Consumers can distinguish a compiler-folded value from
+        // one whose value is only available after template instantiation.
+        literal._meta = { ...literal._meta, dependentEnumValue: true }
       } else literal = this.attach(UAST.literal(Number.isSafeInteger(numeric) ? numeric : value.toString(), 'number'), child)
       return this.attach(UAST.variableDeclaration(this.identifier(child.name || '_', child, child.id), literal, false, this.type(child.type?.qualType)), child)
     })
@@ -401,7 +404,14 @@ export class ClangUastConverter {
             properties.push(UAST.objectProperty(UAST.literal(index, 'number'), this.expression(node.array_filler[0], context)))
           }
           result._meta.clangArrayFilled = missing
-        } else this.unsupported.set('implicit_array_tail', (this.unsupported.get('implicit_array_tail') || 0) + 1)
+        } else {
+          result._meta.clangImplicitArrayTail = {
+            count: missing,
+            elementType: element,
+            defaultValue: this.expression(node.array_filler[0], context),
+            expanded: false,
+          }
+        }
       }
     }
     return result
@@ -632,11 +642,36 @@ export class ClangUastConverter {
         if (ordered) operands.sort((left, right) => left.offset! - right.offset!)
         const result: any = this.attach(UAST.callExpression(this.identifier(ordered && name ? name : '__clang_atomic_expr', node),
           operands.map(operand => this.expression(operand.child, context))), node)
+        const MEMORY_ORDER = ['relaxed', 'consume', 'acquire', 'release', 'acq_rel', 'seq_cst']
+        const isCompareExchange = /compare_exchange/.test(name || '')
+        const orderValue = (child: any): number | undefined => {
+          if (!child) return undefined
+          if (child.kind === 'IntegerLiteral' && child.value !== undefined) {
+            const value = Number(child.value)
+            if (value >= 0 && value <= 5) return value
+          }
+          const declared = child.referencedDecl?.name || ''
+          const named = /^memory_order_(relaxed|consume|acquire|release|acq_rel|seq_cst)$/.exec(declared)
+          if (named) return MEMORY_ORDER.indexOf(named[1])
+          for (const inner of child.inner || []) {
+            const value = orderValue(inner)
+            if (value !== undefined) return value
+          }
+          return undefined
+        }
+        const candidates = children.slice(1).map(child => orderValue(child))
+          .filter((value: number | undefined): value is number => value !== undefined)
+        // compare_exchange carries success/failure orders before the trailing weak flag.
+        const memoryOrders = isCompareExchange ? candidates.slice(0, 2)
+          : [orderValue(children[1])].filter((value: number | undefined): value is number => value !== undefined)
         result._meta.clangAtomic = { builtin: name, argumentOrder: ordered ? 'source' : 'clang_ast',
           result: /_fetch_(?:add|sub|and|or|xor|nand|min|max)$/.test(name || '') ? 'previous_value' :
             /_(?:add|sub|and|or|xor|nand|min|max)_fetch$/.test(name || '') ? 'updated_value' : 'builtin_defined',
-          resultType: node.type?.qualType }
-        this.unsupported.set('atomic_memory_semantics', (this.unsupported.get('atomic_memory_semantics') || 0) + 1)
+          resultType: node.type?.qualType,
+          memoryOrder: memoryOrders.length ? memoryOrders.map(value => ({ value, name: MEMORY_ORDER[value] })) : null }
+        if (!memoryOrders.length) {
+          this.unsupported.set('atomic_memory_semantics', (this.unsupported.get('atomic_memory_semantics') || 0) + 1)
+        }
         if (!ordered || !name) this.unsupported.set('atomic_operand_mapping', (this.unsupported.get('atomic_operand_mapping') || 0) + 1)
         return result
       }
@@ -702,8 +737,9 @@ export class ClangUastConverter {
         statement._meta.goto = this.labels.get(node.targetLabelDeclId) || node.targetLabelDeclId
         const target = this.labelOffsets.get(node.targetLabelDeclId)
         const start = this.begins(node)
-        if (target === undefined || start === undefined || target <= start)
-          this.unsupported.set('goto_control_flow', (this.unsupported.get('goto_control_flow') || 0) + 1)
+        statement._meta.gotoTargetOffset = target ?? null
+        statement._meta.gotoKind = target === undefined || start === undefined || target === start ? 'unknown'
+          : target > start ? 'forward' : 'backward'
         return statement
       }
       case 'StaticAssertDecl': {
@@ -712,12 +748,19 @@ export class ClangUastConverter {
         return assertion
       }
       case 'GCCAsmStmt': {
-        if (!children.length && /^(?:asm|__asm|__asm__)\s*(?:(?:volatile|__volatile|__volatile__)\s*)?\(\s*""\s*\)$/.test(this.text(node).trim())) {
+        const text = this.text(node)
+        if (!children.length && /^(?:asm|__asm|__asm__)\s*(?:(?:volatile|__volatile|__volatile__)\s*)?\(\s*""\s*\)$/.test(text.trim())) {
           const statement: any = this.attach(UAST.noop(), node)
           statement._meta.emptyInlineAssembly = true
           return statement
         }
-        return this.unsupportedNode(node)
+        // Clang exposes input operands as child expressions but does not put the
+        // assembly template or clobbers in AST JSON. Retain the operand statements
+        // and preserve the complete source spelling for consumers; execution
+        // semantics remain explicitly unmodeled.
+        const statement: any = this.attach(UAST.sequence(children.map(child => this.statement(child, context))), node)
+        statement._meta.gnuAsm = { text, volatile: /^(?:asm|__asm|__asm__)\s+(?:volatile|__volatile|__volatile__)\b/.test(text.trim()), modeled: false }
+        return statement
       }
       case 'TypeAliasTemplateDecl': return this.attach(UAST.sequence(this.declarations(children.filter(child => child.kind === 'TypeAliasDecl'), context)), node)
       case 'FriendDecl': return this.attach(UAST.sequence(this.declarations(children, { ...context, scopes: context.scopes.slice(0, -1) })), node)
@@ -740,6 +783,11 @@ export class ClangUastConverter {
       case 'FloatingLiteral': return this.attach(UAST.literal(Number.isFinite(Number(node.value)) ? Number(node.value) : String(node.value), 'number'), node)
       case 'CXXBoolLiteralExpr': return this.attach(UAST.literal(!!node.value, 'boolean'), node)
       case 'CharacterLiteral': return this.attach(UAST.literal(node.value, 'number'), node)
+      case 'PredefinedExpr': {
+        const predefined: any = children[0] ? this.expression(children[0], context) : this.attach(UAST.literal(node.name || '', 'string'), node)
+        predefined._meta = { ...predefined._meta, clangPredefined: node.name || '__func__' }
+        return this.attach(predefined, node)
+      }
       case 'StringLiteral': {
         try {
           const decoded = decodeClangString(node.value)
@@ -802,6 +850,20 @@ export class ClangUastConverter {
           : node.opcode === '*' ? UAST.dereferenceExpression(argument)
           : UAST.unaryExpression(node.opcode, argument, !!node.isPostfix)
         return this.attach(result, node)
+      }
+      case 'ChooseExpr': {
+        const condition = children[0]
+        const conditionValue = this.enumConstant(condition)
+        const selected = conditionValue === undefined ? undefined : conditionValue === 0n ? children[2] : children[1]
+        if (selected) {
+          const result: any = this.attach(this.expression(selected, context), node)
+          result._meta = { ...result._meta, clangChooseExpr: { evaluated: true, selected: conditionValue === 0n ? 'false' : 'true' } }
+          return result
+        }
+        const result: any = this.attach(UAST.conditionalExpression(this.expression(condition, context),
+          this.expression(children[1], context), this.expression(children[2], context)), node)
+        result._meta.clangChooseExpr = { evaluated: false, selected: 'unknown' }
+        return result
       }
       case 'ConditionalOperator': return this.attach(UAST.conditionalExpression(this.expression(children[0], context), this.expression(children[1], context), this.expression(children[2], context)), node)
       case 'PackExpansionExpr': {
@@ -901,6 +963,11 @@ export class ClangUastConverter {
       }
       case 'BreakStmt': return this.attach(UAST.breakStatement(), node)
       case 'ContinueStmt': return this.attach(UAST.continueStatement(), node)
+      case 'EmptyDecl': {
+        const empty: any = this.attach(UAST.noop(), node)
+        empty._meta.emptyDeclaration = true
+        return empty
+      }
       case 'NullStmt':
       case 'AccessSpecDecl':
       case 'TypedefDecl':

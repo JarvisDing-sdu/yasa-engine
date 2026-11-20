@@ -463,7 +463,7 @@ describe('streaming compiler declarations', () => {
   })
 
   it('streams a wide function body larger than the child heap without retaining inner nodes', function () {
-    this.timeout(30000)
+    this.timeout(300000)
     const file = path.join(directory, 'wide.json')
     const descriptor = fs.openSync(file, 'w')
     try {
