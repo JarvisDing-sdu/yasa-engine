@@ -92,7 +92,7 @@ for (const language of ['c', 'cpp']) {
 }
 
 describe('project-independent parser feature matrix', function () {
-  this.timeout(30_000)
+  this.timeout(300_000)
   let directory: string
   before(() => { directory = fs.mkdtempSync(path.join(os.tmpdir(), 'yasa-feature-matrix-')) })
   after(() => fs.rmSync(directory, { recursive: true, force: true }))

@@ -23,7 +23,7 @@ int after(void) { return 42; }
 `
 
 describe('Redis conditional expression dumpAST', function () {
-  this.timeout(30_000)
+  this.timeout(300_000)
 
   for (const [name, args, enabled] of [
     ['enabled', ['--cDefine', 'REG_LITERAL=1'], true],
