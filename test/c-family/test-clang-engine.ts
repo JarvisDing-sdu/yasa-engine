@@ -213,6 +213,68 @@ int main(void){${body}}`, false)
     assert.strictEqual(sarif.runs[0].results.length, 0)
   })
 
+  it('writes through an indexed reference to the selected receiver and element', () => {
+    for (const [name, read, expected] of [
+      ['same', 'a[1]', true], ['other-index', 'a[0]', false], ['other-object', 'b[1]', false],
+      ['direct', 'a.items[1]', true], ['index-once', 'seen', true],
+    ] as const) {
+      const { sarif, graph } = scan('indexed-ref-' + name, `#include <stdlib.h>
+        struct Box {char *items[2]; char *&operator[](int i);};
+        char *&Box::operator[](int i){return items[i];}
+        char *flag, *seen; int next(){seen=flag;flag=(char*)"safe";return 1;}
+        int main(){Box a,b; a.items[0]=(char*)"safe"; b.items[1]=(char*)"safe";
+          flag=getenv("USER"); a[next()]=getenv("USER");return system(${read});}`, true)
+      assert.strictEqual(sarif.runs[0].results.length > 0, expected, name)
+      const pairs = Object.values<any>(graph.edges).map(edge =>
+        [graph.nodes[edge.sourceNodeId].funcDef?.name, graph.nodes[edge.targetNodeId].funcDef?.name])
+      assert.ok(pairs.some(([from, to]) => from === 'main' && to === 'operator[]'), JSON.stringify(pairs))
+    }
+  })
+
+  it('uses the backing field of the overload selected by Clang', () => {
+    for (const [name, expression, expected] of [
+      ['direct-control', 'b.b[0]', false], ['direct-b', 'b.b[0]', false], ['int', 'b[0]', true], ['long', 'b[0L]', false],
+    ] as const) {
+      const { sarif } = scan('indexed-overload-' + name, `#include <stdlib.h>
+        struct Box {char *a[1], *b[1]; char *&operator[](int i){return a[i];}
+          char *&operator[](long i){return b[i];}};
+        int main(){Box b; b.a[0]=(char*)"safe"; b.b[0]=(char*)"safe";
+          ${name === 'direct-control' ? 'b.a[0]' : 'b[0]'}=getenv("USER"); return system(${expression});}`, true)
+      assert.strictEqual(sarif.runs[0].results.length > 0, expected, name)
+    }
+  })
+
+  it('writes a compound result back after evaluating its right operand', () => {
+    for (const index of [0, 1]) {
+      const { sarif } = scan('indexed-compound-' + index, `#include <stdlib.h>
+        struct Box {long items[2]; long &operator[](int i){return items[i];}};
+        int target=0; long input(){target=1;return (long)getenv("USER");}
+        int main(){Box a; a.items[0]=0; a.items[1]=0;
+          a[target]+=input();return system((char*)a.items[${index}]);}`, true)
+      assert.strictEqual(sarif.runs[0].results.length > 0, index === 1)
+    }
+  })
+
+  it('keeps the outer receiver when another subscript computes the index', () => {
+    for (const name of ['a', 'b']) {
+      const { sarif } = scan('indexed-nested-' + name, `#include <stdlib.h>
+        struct Box {char *items[2]; char *&operator[](int i){return items[i];}};
+        int main(){Box a,b; a.items[1]=(char*)"safe"; b.items[1]=(char*)"safe"; b.items[0]=nullptr;
+          a[b[0] ? 0 : 1]=getenv("USER"); return system(${name}.items[1]);}`, true)
+      assert.strictEqual(sarif.runs[0].results.length > 0, name === 'a', name)
+    }
+  })
+
+  it('writes through a void pointer view to its original backing array', () => {
+    for (const index of [0, 1]) {
+      const { sarif } = scan('indexed-view-' + index, `#include <stdlib.h>
+        struct View {void *data; char *&operator[](unsigned i){return ((char**)data)[i];}};
+        int main(){char *slots[2]={(char*)"safe",(char*)"safe"}; View view; view.data=slots;
+          view[1]=getenv("USER");return system(slots[${index}]);}`, true)
+      assert.strictEqual(sarif.runs[0].results.length > 0, index === 1)
+    }
+  })
+
   it('uses the override when calling through a base pointer', () => {
     const { sarif, graph } = scan('override', `#include <stdlib.h>
       struct B {virtual char *read()=0;}; struct D:B {char *read() override {return getenv("USER");}};

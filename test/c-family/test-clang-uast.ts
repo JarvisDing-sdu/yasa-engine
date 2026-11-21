@@ -612,6 +612,31 @@ describe('experimental Clang AST to UAST', function () {
     assert.ok(walk(run, 'AssignmentExpression').every(node => node.left.type === 'CallExpression'))
   })
 
+  it('binds only proven indexed storage to the selected overload, including a later definition', () => {
+    const source = path.join(directory, 'indexed-accessor.cpp')
+    fs.writeFileSync(source, `struct Box {void *data; int &operator[](int); int &operator[](long);};
+      struct Base {int entries[2]; virtual int &operator[](int i){return entries[i];}};
+      struct Static {static int entries[2]; int &operator[](int i){return this->entries[i];}};
+      int index(); int input();
+      void run(Box &b, Base &v, Static &s){b[index()]=input(); b[0L]=1; v[0]=2; s[0]=3; b[0]+=4; b[0]|=4;}
+      int &Box::operator[](int i){return ((int*)data)[i];}
+      int &Box::operator[](long i){return ((int*)data)[i+1];}`)
+    const database = source + '.compile.json', report = source + '.json'
+    fs.writeFileSync(database, JSON.stringify([{ directory, file: source, arguments: ['clang++', '-std=c++17', '-c', source] }]))
+    const child = spawnSync(process.execPath, ['--import', 'tsx', 'src/main.ts', '--sourcePath', source,
+      '--language', 'cpp', '--dumpAST', '--cCompileCommands', database, '--cAstBackend', 'clang', '--report', report], { cwd: engine, encoding: 'utf8' })
+    assert.strictEqual(child.status, 0, child.stdout + child.stderr)
+    const ast = JSON.parse(fs.readFileSync(report, 'utf8')), run = walk(ast, 'FunctionDefinition').find(fn => fn.id.name === 'run')
+    const assignments = walk(run, 'AssignmentExpression')
+    assert.deepStrictEqual(assignments.map(a => a.left._meta.clangIndexedReference), ['data', undefined, undefined, undefined, 'data', 'data'])
+    assert.strictEqual(ast._meta.clangBackend.unsupported.assignment_location_semantics, 4)
+    const call = assignments[0].left
+    assert.strictEqual(call.callee.object.name, 'b')
+    assert.strictEqual(call.callee.property.name, 'operator[]')
+    assert.strictEqual(call.arguments[0].callee.name, 'index')
+    assert.strictEqual(walk(run, 'CallExpression').filter(node => node.callee.name === 'input').length, 1)
+  })
+
   it('keeps offsetof index evaluation visibly partial', () => {
     const source = path.join(directory, 'indexed-offset.c')
     fs.writeFileSync(source, '#include <stddef.h>\nstruct Array { int values[8]; }; int index(void); unsigned long offset(void) { return offsetof(struct Array, values[index()]); }')

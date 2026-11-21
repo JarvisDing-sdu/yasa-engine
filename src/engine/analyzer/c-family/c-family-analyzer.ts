@@ -152,7 +152,7 @@ class CFamilyAnalyzer extends CAnalyzer {
    * @param oldValue
    * @returns {any} The saved symbolic value.
    */
-  saveVarInScope(scope: any, node: any, value: any, state: any, oldValue: any = null): any {
+  override saveVarInScope(scope: any, node: any, value: any, state: any, oldValue: any = null): any {
     const symbol = node?._meta?.cFamilySymbol
     return super.saveVarInScope(
       symbol?.kind === 'variable' && symbol.global ? this.topScope : scope,

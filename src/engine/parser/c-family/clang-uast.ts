@@ -4,6 +4,7 @@ import * as UAST from '@ant-yasa/uast-spec'
 import { mapOrigin, RawCoordinates } from './source-map'
 import type { SourceSegment } from './source-map'
 import { readCompilerDeclarations } from './compiler-declarations'
+import { supportsIndexedAssignment } from './indexed-reference'
 import { decodeClangString } from './clang-string'
 
 type Ast = { kind?: string; id?: string; name?: string; inner?: Ast[]; [key: string]: any }
@@ -38,6 +39,10 @@ export class ClangUastConverter {
   private readonly records = new Map<string, { ast: any; scopes: string[] }>()
   private readonly parameterDefaults = new Map<string, Array<DefaultValue | undefined>>()
   private readonly fieldDefaults = new Map<string, DefaultValue>()
+  private readonly subscriptOwnerFields = new Map<string, Set<string>>()
+  private readonly subscriptFields = new Map<string, string>()
+  private readonly subscriptCalls: any[] = []
+  private readonly referenceAssignments: any[] = []
   private readonly pendingDefaults: Array<{ arguments: any[]; index: number; key: string; context: Context; parameterIndex: number }> = []
   private readonly labelOffsets = new Map<string, number>()
 
@@ -210,6 +215,33 @@ export class ClangUastConverter {
     return { ...body, inner: top }
   }
 
+  /** Recognize a direct reference to this->field[index], including a pointer view of void storage. */
+  private indexAccessor(node: Ast, body: Ast): void {
+    if (!node.id) return
+    const fields = this.subscriptOwnerFields.get(node.id) || this.subscriptOwnerFields.get(node.previousDecl)
+    if (!fields) return
+    if (body.inner?.length !== 1 || body.inner[0].kind !== 'ReturnStmt') return
+    const subscript = body.inner[0].inner?.[0]
+    if (subscript?.kind !== 'ArraySubscriptExpr' || subscript.valueCategory !== 'lvalue') return
+    const unwrap = (expr?: Ast): Ast | undefined => {
+      while (expr && expr.inner?.length === 1) {
+        if (/\bvolatile\b/.test(expr.type?.qualType || '')) return undefined
+        const implicit = expr.kind === 'ImplicitCastExpr' && ['LValueToRValue', 'ArrayToPointerDecay', 'NoOp'].includes(expr.castKind)
+        const pointerView = ['CStyleCastExpr', 'CXXStaticCastExpr', 'CXXReinterpretCastExpr'].includes(expr.kind || '') &&
+          expr.castKind === 'BitCast' && /^(?:const )?void\s*\*$/.test(expr.inner[0].type?.qualType || '')
+        if (expr.kind !== 'ParenExpr' && !implicit && !pointerView) break
+        expr = expr.inner[0]
+      }
+      return expr
+    }
+    const field = unwrap(subscript.inner?.[0]), index = unwrap(subscript.inner?.[1])
+    const params = node.inner?.filter(child => child.kind === 'ParmVarDecl')
+    if (field?.kind !== 'MemberExpr' || !field.name || !fields.has(field.referencedMemberDecl) || field.inner?.[0]?.kind !== 'CXXThisExpr') return
+    if (params?.length !== 1 || !params[0].id || index?.kind !== 'DeclRefExpr' || index.referencedDecl?.id !== params[0].id) return
+    this.subscriptFields.set(node.id, field.name)
+    if (node.previousDecl) this.subscriptFields.set(node.previousDecl, field.name)
+  }
+
   private function(node: Ast, context: Context): any {
     const children = node.inner || []
     const previous = this.parameterDefaults.get(node.previousDecl)
@@ -225,6 +257,7 @@ export class ClangUastConverter {
       prototype._meta.prototype = node.name
       return prototype
     }
+    if (node.name === 'operator[]') this.indexAccessor(node, body)
     const pending = [body]
     while (pending.length) {
       const statement = pending.pop()!
@@ -350,6 +383,14 @@ export class ClangUastConverter {
       }
       if (node.definitionData?.defaultCtor?.trivial) this.trivialDefaults.add(scopes.join('::'))
       this.recordMembers.set(scopes.join('::'), members)
+    }
+    if (!node.bases?.length) {
+      const fields = new Set<string>(declaredMembers.filter(child => child.kind === 'FieldDecl' && child.id).map(child => child.id!))
+      for (const child of declaredMembers) {
+        if (child.kind === 'CXXMethodDecl' && child.name === 'operator[]' && child.id &&
+            !child.virtual && !/\bvolatile\b/.test(child.type?.qualType || '') &&
+            /&\s*\(/.test(child.type?.qualType || '')) this.subscriptOwnerFields.set(child.id, fields)
+      }
     }
     result.body.push(...this.declarations(node.inner || [], { ...context, scopes }))
     return result
@@ -869,11 +910,11 @@ export class ClangUastConverter {
             children[0]?.type?.qualType === '<dependent type>'
           if (!UAST.isLVal(left) && left.type !== 'DereferenceExpression' && !referenceCall && !dependentTarget) return this.unsupportedNode(node)
           if (dependentTarget) this.unsupported.set('dependent_assignment_target', (this.unsupported.get('dependent_assignment_target') || 0) + 1)
-          if (referenceCall) this.unsupported.set('assignment_location_semantics', (this.unsupported.get('assignment_location_semantics') || 0) + 1)
           // Clang lvalues include dereferences and reference-returning calls beyond the shared LVal schema.
           // Preserve both operands while reporting unresolved write-back semantics for calls.
           const assignment = UAST.assignmentExpression(UAST.identifier('_'), right, node.opcode, false)
           assignment.left = left
+          if (referenceCall) this.referenceAssignments.push(assignment)
           if (dependentTarget) assignment._meta = { ...assignment._meta, clangDependentAssignment: true }
           return this.attach(assignment, node)
         }
@@ -919,7 +960,10 @@ export class ClangUastConverter {
           return this.attach(UAST.callExpression(this.expression(children[1], context), this.arguments(children.slice(2), context, this.calleeReference(children[0]).id || '')), node)
         }
         const reference = this.calleeReference(children[0])
-        return this.attach(UAST.callExpression(callee, this.arguments(children.slice(1), context, reference.id || '', reference.kind === 'CXXMethodDecl' ? -1 : 0)), node)
+        const args = this.arguments(children.slice(1), context, reference.id || '', reference.kind === 'CXXMethodDecl' ? -1 : 0)
+        const call = this.attach(UAST.callExpression(callee, args), node)
+        if (callee.name === 'operator[]' && reference.kind === 'CXXMethodDecl' && call.arguments.length === 2) this.subscriptCalls.push(call)
+        return call
       }
       case 'MemberExpr': {
         const result: any = this.attach(UAST.memberAccess(this.expression(children[0], context), this.identifier(node.name || '_', { ...node, range: { begin: node.range?.end, end: node.range?.end } }, node.referencedMemberDecl), false), node)
@@ -1042,6 +1086,18 @@ export class ClangUastConverter {
           ...value.context, defaultStack: [...(pending.context.defaultStack || []), key],
         })
       } else this.unsupported.set('CXXDefaultArgExpr', (this.unsupported.get('CXXDefaultArgExpr') || 0) + 1)
+    }
+    for (const call of this.subscriptCalls) {
+      const field = this.subscriptFields.get(call.callee._meta?.clangDeclarationId)
+      if (!field) continue
+      const [receiver, index] = call.arguments
+      call.callee = { ...UAST.memberAccess(receiver, call.callee, false), loc: call.loc }
+      call.arguments = [index]
+      call._meta.clangIndexedReference = field
+    }
+    for (const assignment of this.referenceAssignments) {
+      if (assignment.left._meta?.clangIndexedReference && supportsIndexedAssignment(assignment.operator)) continue
+      this.unsupported.set('assignment_location_semantics', (this.unsupported.get('assignment_location_semantics') || 0) + 1)
     }
     const result: any = UAST.compileUnit(this.body, 'php' as any, this.options.languageVersion || (this.options.language === 'c' ? 'c11' : 'c++17'), this.options.sourcefile, '0.0.0')
     result.language = this.options.language

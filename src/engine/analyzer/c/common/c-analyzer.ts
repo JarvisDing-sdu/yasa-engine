@@ -16,6 +16,7 @@ const { executeViaEntryPointExecutor } =
 const { handleException } = require('../../common/exception-handler')
 const { applyCLibraryModel } = require('./builtins/c-builtins')
 const StateUtil = require('../../../util/state-util')
+import { supportsIndexedAssignment } from '../../../parser/c-family/indexed-reference'
 const { foldConstant } = require('./c-const-eval')
 const { CTypeIndex } = require('./c-types')
 const { CCallbackIndex } = require('./c-callbacks')
@@ -155,6 +156,49 @@ function containsLabel(node: any, labels: Set<string>): boolean {
  */
 class CAnalyzer extends Analyzer {
   private lambdaCaptureSequence = 0
+  private indexedWrite?: { call: any; receiver?: any; index?: any }
+
+  override processMemberAccess(scope: any, node: any, state: any): any {
+    const member = super.processMemberAccess(scope, node, state)
+    // Clang gives the selected operator's function type even when runtime argument values
+    // no longer distinguish int from long (or a const receiver from a mutable receiver).
+    const clang = node.property?._meta?.clang
+    if (node.property?.name !== 'operator[]' || clang?.kind !== 'DeclRefExpr' || !clang.type || member.vtype !== 'fclos') return member
+    const overloads = member.overloaded?.filter(() => true) || []
+    const matching = overloads.filter((fn: any) => fn._meta?.clang?.type === clang.type)
+    const selected = matching.length === 1 ? matching[0] :
+      matching.find((fn: any) => fn._meta?.clang?.id === node.property._meta.clangDeclarationId)
+    if (!selected || (overloads.length === 1 && selected === member.ast.fdef)) return member
+    const bound = lodashCloneWithTag(member)
+    bound.ast = selected
+    bound.ast.fdef = selected
+    bound.overloaded = undefined
+    return bound
+  }
+
+  override buildCallArgs(node: any, argvalues: any[], fclos: any) {
+    const args = super.buildCallArgs(node, argvalues, fclos)
+    const write = this.indexedWrite
+    if (write && write.call === node) {
+      write.receiver = args.receiver
+      write.index = argvalues[0]
+    }
+    return args
+  }
+
+  saveVarInScope(scope: any, node: any, value: any, state: any, oldValue: any = null): any {
+    const write = this.indexedWrite
+    if (write && write.call === node && write.receiver && write.index) {
+      const field = { type: 'Identifier', name: node._meta.clangIndexedReference, loc: node.loc }
+      let storage = this.getMemberValueNoCreate(write.receiver, field, state)
+      if (!storage || ['undefine', 'uninitialized', 'symbol'].includes(storage.vtype)) {
+        storage = new ObjectValue(write.receiver.qid, { sid: field.name, parent: write.receiver })
+        this.saveVarInCurrentScope(write.receiver, field, storage, state)
+      }
+      return this.saveVarInScopeRec(storage, write.index, value, state)
+    }
+    return super.saveVarInScope(scope, node, value, state, oldValue)
+  }
 
   /** 文件名 → 模块 scope */
   private moduleScopes = new Map<string, any>()
@@ -614,7 +658,7 @@ class CAnalyzer extends Analyzer {
       return this.topScope.value[node.id.name]
     }
     if (!node.init && !node._meta?.isParameter && isAggregateType(node.varType)) {
-      const init = { type: 'ObjectExpression', properties: [], loc: node.loc, _meta: { aggregate: true } }
+      const init = { type: 'ObjectExpression', properties: [], loc: node.loc, _meta: { aggregateName: node.id?.name } }
       return super.processVariableDeclaration(target, { ...node, init }, state)
     }
     const init = this.types.keyInitializer(node.init, node.varType)
@@ -688,6 +732,18 @@ class CAnalyzer extends Analyzer {
    * @returns 赋值结果
    */
   override processAssignmentExpression(scope: any, node: any, state: any): any {
+    if (node?.left?._meta?.clangIndexedReference && supportsIndexedAssignment(node.operator)) {
+      // Capture the receiver and index from the actual invocation. Never re-evaluate either at write-back.
+      const previous = this.indexedWrite
+      this.indexedWrite = { call: node.left }
+      try {
+        // The shared compound evaluator reads the left operand first. C++17 sequences the RHS first.
+        const assignment = node.operator === '=' ? node : { ...node, right: this.processInstruction(scope, node.right, state) }
+        return super.processAssignmentExpression(scope, assignment, state)
+      } finally {
+        this.indexedWrite = previous
+      }
+    }
     if (node?.left?.type === 'DereferenceExpression' && node.operator === '=') {
       return this.assignThroughPointer(scope, node, state)
     }
