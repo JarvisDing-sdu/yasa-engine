@@ -16,6 +16,7 @@ const { executeViaEntryPointExecutor } =
 const { handleException } = require('../../common/exception-handler')
 const { applyCLibraryModel } = require('./builtins/c-builtins')
 const StateUtil = require('../../../util/state-util')
+import { supportsIndexedAssignment } from '../../../parser/c-family/indexed-reference'
 const { foldConstant } = require('./c-const-eval')
 const { CTypeIndex } = require('./c-types')
 const { CCallbackIndex } = require('./c-callbacks')
@@ -155,6 +156,72 @@ function containsLabel(node: any, labels: Set<string>): boolean {
  */
 class CAnalyzer extends Analyzer {
   private lambdaCaptureSequence = 0
+  private indexedWrite?: { call: any; receiver?: any; index?: any }
+
+  override processMemberAccess(scope: any, node: any, state: any): any {
+    let member = super.processMemberAccess(scope, node, state)
+    if (node._meta?.clangDestructorOwner && member.vtype !== 'fclos') {
+      // The pointer may originate outside this translation unit. A nonvirtual destructor
+      // has a static target even when the object's field values are unknown.
+      const owner = this.processInstruction(scope, { type: 'Identifier', name: node._meta.clangDestructorOwner }, state)
+      const target = owner?.getMemberValue?.(node.property.name)
+      if (target?.vtype === 'fclos' && target.ast?.fdef?._meta?.clang?.mangledName === node._meta.clangDestructorSymbol) {
+        const bound = lodashCloneWithTag(target)
+        bound._this = member._this
+        member = bound
+      }
+    }
+    // Clang gives the selected operator's function type even when runtime argument values
+    // no longer distinguish int from long (or a const receiver from a mutable receiver).
+    const clang = node.property?._meta?.clang
+    const methodSymbol = node._meta?.clangConstructorSymbol || node._meta?.clangDestructorSymbol
+    const indexedCall = node.property?.name === 'operator[]' && clang?.kind === 'DeclRefExpr' && clang.type
+    if (!methodSymbol && !indexedCall) return member
+    if (member.vtype !== 'fclos') return methodSymbol ? new UndefinedValue() : member
+    const overloads = member.overloaded?.filter(() => true) || []
+    let selected
+    if (methodSymbol) {
+      selected = member.ast?.fdef?._meta?.clang?.mangledName === methodSymbol ? member.ast.fdef :
+        overloads.find((fn: any) => fn._meta?.clang?.mangledName === methodSymbol)
+      // The translation unit may contain only the declaration of the selected body.
+      if (!selected) return new UndefinedValue()
+    } else {
+      const matching = overloads.filter((fn: any) => fn._meta?.clang?.type === clang.type)
+      selected = matching.length === 1 ? matching[0] :
+        matching.find((fn: any) => fn._meta?.clang?.id === node.property._meta.clangDeclarationId)
+      if (!selected) return member
+    }
+    if (overloads.length <= 1 && selected === member.ast.fdef && (!overloads.length || selected === overloads[0])) return member
+    const bound = lodashCloneWithTag(member)
+    bound.ast = selected
+    bound.ast.fdef = selected
+    bound.overloaded = undefined
+    return bound
+  }
+
+  override buildCallArgs(node: any, argvalues: any[], fclos: any) {
+    const args = super.buildCallArgs(node, argvalues, fclos)
+    const write = this.indexedWrite
+    if (write && write.call === node) {
+      write.receiver = args.receiver
+      write.index = argvalues[0]
+    }
+    return args
+  }
+
+  saveVarInScope(scope: any, node: any, value: any, state: any, oldValue: any = null): any {
+    const write = this.indexedWrite
+    if (write && write.call === node && write.receiver && write.index) {
+      const field = { type: 'Identifier', name: node._meta.clangIndexedReference, loc: node.loc }
+      let storage = this.getMemberValueNoCreate(write.receiver, field, state)
+      if (!storage || ['undefine', 'uninitialized', 'symbol'].includes(storage.vtype)) {
+        storage = new ObjectValue(write.receiver.qid, { sid: field.name, parent: write.receiver })
+        this.saveVarInCurrentScope(write.receiver, field, storage, state)
+      }
+      return this.saveVarInScopeRec(storage, write.index, value, state)
+    }
+    return super.saveVarInScope(scope, node, value, state, oldValue)
+  }
 
   /** 文件名 → 模块 scope */
   private moduleScopes = new Map<string, any>()
@@ -472,12 +539,20 @@ class CAnalyzer extends Analyzer {
     }
   }
 
+  override processUnaryExpression(scope: any, node: any, state: any): any {
+    if (!node._meta?.clangDelete) return super.processUnaryExpression(scope, node, state)
+    this.processInstruction(scope, node.argument, state)
+    return new UndefinedValue()
+  }
+
   /** GNU statement expressions yield their last value inside a local block scope. */
   override processSequence(scope: any, node: any, state: any): any {
-    if (!node._meta?.gnuStatementExpression) return super.processSequence(scope, node, state)
+    const deleting = node._meta?.clangDelete?.lowering === 'guarded_calls'
+    if (!deleting && !node._meta?.gnuStatementExpression) return super.processSequence(scope, node, state)
     const start = node.loc?.start
     const block = Scope.createSubScope(`<statement_expression_${start?.line}_${start?.column}>`, scope, 'scope')
-    return super.processSequence(block, node, state)
+    const value = super.processSequence(block, node, state)
+    return deleting || node._meta.clangStatementExpression?.yieldsValue === false ? new UndefinedValue() : value
   }
 
   /**
@@ -489,6 +564,17 @@ class CAnalyzer extends Analyzer {
    */
   override processCallExpression(scope: any, node: any, state: any): any {
     const callee = node?.callee
+    if (node._meta?.clangStdSubscript) {
+      const receiver = this.processInstruction(scope, callee.object, state)
+      const index = this.processInstruction(scope, node.arguments[0], state)
+      const write = this.indexedWrite
+      if (write && write.call === node) {
+        write.receiver = receiver
+        write.index = index
+      }
+      const storage = this.getMemberValueNoCreate(receiver, { type: 'Identifier', name: node._meta.clangIndexedReference }, state)
+      return storage ? this.getMemberValue(storage, index, state) : new UndefinedValue()
+    }
     if (callee?.type === 'Identifier' && COMPILE_TIME_OPERATORS.has(callee.name)) {
       return new PrimitiveValue(scope.qid, `<${callee.name}>`, null, 'number', 'Literal', node.loc)
     }
@@ -614,7 +700,7 @@ class CAnalyzer extends Analyzer {
       return this.topScope.value[node.id.name]
     }
     if (!node.init && !node._meta?.isParameter && isAggregateType(node.varType)) {
-      const init = { type: 'ObjectExpression', properties: [], loc: node.loc, _meta: { aggregate: true } }
+      const init = { type: 'ObjectExpression', properties: [], loc: node.loc, _meta: { aggregateName: node.id?.name } }
       return super.processVariableDeclaration(target, { ...node, init }, state)
     }
     const init = this.types.keyInitializer(node.init, node.varType)
@@ -688,6 +774,21 @@ class CAnalyzer extends Analyzer {
    * @returns 赋值结果
    */
   override processAssignmentExpression(scope: any, node: any, state: any): any {
+    // C++17 sequences a compound assignment's RHS before evaluating its target.
+    // This is also a permitted evaluation order for compiler-produced C expressions.
+    if (node?._meta?.clang?.kind === 'CompoundAssignOperator') {
+      node = { ...node, right: this.processInstruction(scope, node.right, state) }
+    }
+    if (node?.left?._meta?.clangIndexedReference && supportsIndexedAssignment(node.operator)) {
+      // Capture the receiver and index from the actual invocation. Never re-evaluate either at write-back.
+      const previous = this.indexedWrite
+      this.indexedWrite = { call: node.left }
+      try {
+        return super.processAssignmentExpression(scope, node, state)
+      } finally {
+        this.indexedWrite = previous
+      }
+    }
     if (node?.left?.type === 'DereferenceExpression' && node.operator === '=') {
       return this.assignThroughPointer(scope, node, state)
     }
@@ -1006,6 +1107,11 @@ class CAnalyzer extends Analyzer {
    * @returns 语句结果
    */
   override processIfStatement(scope: any, node: any, state: any): any {
+    if (node._meta?.clangDeleteGuard) {
+      // The operand has already been saved. Literal null pointers cannot invoke a destructor.
+      const pointer = this.processInstruction(scope, node.test, state)
+      if (pointer?.type === 'Literal' && ((pointer.literalType === 'null' && pointer.value === null) || pointer.value === 0)) return new UndefinedValue()
+    }
     const constant = foldConstant(node?.test)
     if (constant !== undefined) {
       const taken = constant ? node.consequent : node.alternative

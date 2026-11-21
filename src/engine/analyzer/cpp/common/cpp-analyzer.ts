@@ -539,7 +539,7 @@ class CppAnalyzer extends CAnalyzer {
    * @param oldVal - Previous assigned value
    * @returns {any} Resolved analysis value.
    */
-  saveVarInScope(scope: any, node: any, value: any, state: any, oldVal: any = null): any {
+  override saveVarInScope(scope: any, node: any, value: any, state: any, oldVal: any = null): any {
     const binding = this.resolveBinding(scope, node)
     return super.saveVarInScope(
       binding?.scope || scope,

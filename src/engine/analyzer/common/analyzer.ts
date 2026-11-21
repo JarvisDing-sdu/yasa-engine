@@ -2260,6 +2260,7 @@ class Analyzer extends BaseAnalyzer {
         return tmpVal
       }
       case '&=':
+      case '|=':
       case '^=':
       case '<<=':
       case '>>=':
@@ -2461,7 +2462,8 @@ class Analyzer extends BaseAnalyzer {
    */
   processObjectExpression(scope: ScopeType, node: ObjectExpression, state: State): SymbolValueType {
     // FIXME
-    const objSid = `<object_${node.loc?.start?.line}_${node.loc?.end?.line}>`
+    const binding = node._meta?.aggregateName
+    const objSid = `<object_${node.loc?.start?.line}_${node.loc?.end?.line}${binding ? '_' + binding : ''}>`
     let res = new Scoped(scope.qid, {
       sid: objSid,
       parent: scope,

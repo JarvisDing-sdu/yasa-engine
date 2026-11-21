@@ -130,7 +130,7 @@ export async function runCompilerDumpCLI(args: string[]): Promise<void> {
         const prepared = await preprocessUnit(context, temporary, (raw: string, map: typeof sourceMap) => {
           converter = new ClangUastConverter({ raw, sourceMap: map, sourcefile: generatedSource, originalSourcefile: source,
             language: opts.language, languageVersion: context.standard || undefined })
-          return { shouldRetain: (node: any) => converter.includesDeclaration(node), consume: (node: any) => converter.add(node) }
+          return { observeSubscript: (node: any) => converter.observeSubscript(node), shouldRetain: (node: any) => converter.includesDeclaration(node), consume: (node: any) => converter.add(node) }
         })
         if (prepared.status !== 'prepared') {
           const messages = prepared.diagnostics.map((diagnostic: any) => diagnostic.message)

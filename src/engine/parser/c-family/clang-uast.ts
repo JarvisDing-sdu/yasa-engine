@@ -4,11 +4,90 @@ import * as UAST from '@ant-yasa/uast-spec'
 import { mapOrigin, RawCoordinates } from './source-map'
 import type { SourceSegment } from './source-map'
 import { readCompilerDeclarations } from './compiler-declarations'
+import { supportsIndexedAssignment } from './indexed-reference'
 import { decodeClangString } from './clang-string'
 
 type Ast = { kind?: string; id?: string; name?: string; inner?: Ast[]; [key: string]: any }
-type Context = { scopes: string[]; languageLinkage: string; inFunction?: boolean; defaultStack?: string[] }
+type Context = { scopes: string[]; languageLinkage: string; inFunction?: boolean; defaultStack?: string[]; localTypes?: Set<string>; fixedPointers?: Map<string, Destruction> }
+type Destruction = {
+  owner: string; trivial: boolean; method?: Ast; implicitBody: boolean; simpleMembers: boolean
+  virtual: boolean; final: boolean; hasBases: boolean; plainLayout: boolean; declaresDeallocator: boolean
+  lookupBlockers: Set<string>
+}
 type DefaultValue = { node: Ast; context: Context }
+// Only these expression forms can be proven free of implicit class construction and cleanup here.
+const trivialStatementKinds = new Set([
+  'StmtExpr', 'CompoundStmt', 'DeclStmt', 'VarDecl', 'DeclRefExpr', 'ParenExpr', 'ImplicitCastExpr',
+  'CStyleCastExpr', 'CXXStaticCastExpr', 'BinaryOperator', 'CompoundAssignOperator', 'UnaryOperator',
+  'ConditionalOperator', 'ArraySubscriptExpr', 'MemberExpr', 'CXXThisExpr', 'UnaryExprOrTypeTraitExpr',
+  'IntegerLiteral', 'FloatingLiteral', 'CharacterLiteral', 'CXXBoolLiteralExpr', 'CallExpr',
+])
+const isArithmetic = (type: string) =>
+  /^(?:(?:const|volatile|signed|unsigned)\s+)*(?:char|short|int|long|long long|long double|float|double|bool)(?: int)?$/.test(type)
+const canonicalType = (node: Ast) => node.type?.desugaredQualType || node.type?.qualType || ''
+
+const pointeeType = (type: string) => /^(.*?)\s*\*\s*(?:const\s*)?$/.exec(type)?.[1]
+  .replace(/^(?:(?:const|volatile|struct|class)\s+)*/, '').trim() || ''
+
+function beforeUpcast(input: Ast): Ast {
+  let node = input
+  while (node.inner?.length === 1 && (node.kind === 'ParenExpr' ||
+    (['ImplicitCastExpr', 'CXXStaticCastExpr'].includes(node.kind || '') && ['DerivedToBase', 'NoOp'].includes(node.castKind)))) {
+    node = node.inner[0]
+  }
+  return node
+}
+
+// Clang can omit the name of a dependent reference. Strip only a balanced trailing
+// template argument list before looking for its qualifier (T::f<other::X>).
+function dependentSpelling(spelling: string, declared?: string) {
+  let prefix = spelling.trim()
+  let argumentsText: string | undefined
+  if (prefix.endsWith('>') && !declared?.startsWith('operator')) {
+    let depth = 0
+    for (let i = prefix.length - 1; i >= 0; i--) {
+      if (prefix[i] === '>') depth++
+      else if (prefix[i] === '<' && --depth === 0) {
+        argumentsText = prefix.slice(i)
+        prefix = prefix.slice(0, i).trimEnd()
+        break
+      }
+    }
+  }
+  const name = declared || /([A-Za-z_]\w*)$/.exec(prefix)?.[1] || '_'
+  const before = prefix.endsWith(name) ? prefix.slice(0, -name.length).replace(/\btemplate\s*$/, '').trimEnd() : ''
+  const qualifier = before.endsWith('::') ? before.slice(0, -2).trimEnd() : undefined
+  return { name, qualifier, argumentsText }
+}
+
+/** Prove that the block returns a scalar value or void and no block-local storage escapes. */
+function hasTrivialStatementLifetime(root: Ast): boolean {
+  if (root.valueCategory !== 'prvalue' || !(canonicalType(root) === 'void' || isArithmetic(canonicalType(root)))) return false
+  const locals = new Set<string>()
+  const addressed = new Set<string>()
+  const pending = [{ node: root, takingAddress: false }]
+  while (pending.length) {
+    const { node, takingAddress } = pending.pop()!
+    if (!trivialStatementKinds.has(node.kind || '')) return false
+    const children = node.inner || []
+    if (node.kind === 'VarDecl') {
+      if (!node.id || !isArithmetic(canonicalType(node)) || node.storageClass || node.tls) return false
+      locals.add(node.id)
+    }
+    if (takingAddress && node.kind === 'DeclRefExpr') {
+      if (!node.referencedDecl?.id) return false
+      addressed.add(node.referencedDecl.id)
+    }
+    // An lvalue argument could bind to a reference parameter that outlives the block.
+    if (node.kind === 'CallExpr' && (node.valueCategory !== 'prvalue' ||
+        !(canonicalType(node) === 'void' || isArithmetic(canonicalType(node))) ||
+        children.slice(1).some(arg => arg.valueCategory !== 'prvalue'))) return false
+    const address = takingAddress || (node.kind === 'UnaryOperator' && node.opcode === '&')
+    for (const child of children) pending.push({ node: child, takingAddress: address })
+  }
+  return ![...addressed].some(id => locals.has(id))
+}
+
 export interface ClangUastOptions {
   sourcefile: string
   language: 'c' | 'cpp'
@@ -29,11 +108,25 @@ export class ClangUastConverter {
   private readonly body: any[] = []
   private readonly recordFields = new Map<string, string[]>()
   private readonly recordMembers = new Map<string, Set<string>>()
+  private readonly fixedVirtuals = new Set<string>()
+  private readonly virtualMethods = new Map<string, Set<string>>()
+  private readonly directBases = new Map<string, string>()
+  private readonly constructorSymbols = new Map<string, Map<string, string | undefined>>()
+  private readonly recordRoots = new Map<string, string>()
+  private readonly importedRecords = new Map<string, string>()
+  private readonly destruction = new Map<string, Destruction>()
+  private readonly zeroFields = new Map<string, Array<{ name: string; type: string }>>()
+  private readonly trivialDefaults = new Set<string>()
   private readonly enumValues = new Map<string, string>()
   private readonly labels = new Map<string, string>()
   private readonly records = new Map<string, { ast: any; scopes: string[] }>()
   private readonly parameterDefaults = new Map<string, Array<DefaultValue | undefined>>()
   private readonly fieldDefaults = new Map<string, DefaultValue>()
+  private readonly subscriptOwnerFields = new Map<string, Set<string>>()
+  private readonly subscriptFields = new Map<string, string>()
+  private readonly systemSubscripts = new Set<string>()
+  private readonly subscriptCalls: any[] = []
+  private readonly referenceAssignments: any[] = []
   private readonly pendingDefaults: Array<{ arguments: any[]; index: number; key: string; context: Context; parameterIndex: number }> = []
   private readonly labelOffsets = new Map<string, number>()
 
@@ -130,11 +223,16 @@ export class ClangUastConverter {
   }
 
   private flatten(nodes: any[]): any[] {
-    return nodes.flatMap(node => !node ? [] : node.type === 'Sequence' && !node._meta?.gnuStatementExpression && !node._meta?.gnuAsm ? this.flatten(node.expressions) : [node])
+    return nodes.flatMap(node => !node ? [] : node.type === 'Sequence' && !node._meta?.gnuStatementExpression && !node._meta?.gnuAsm && !node._meta?.clangDelete ? this.flatten(node.expressions) : [node])
   }
 
   private declarations(nodes: Ast[], context: Context): any[] {
-    return this.flatten(nodes.filter(node => !node.isImplicit && this.includesDeclaration(node)).map(node => this.visit(node, context)))
+    const retained = []
+    for (const node of nodes) {
+      if (node.kind === 'UsingShadowDecl') this.indexImportedRecord(node, context.scopes)
+      else if (!node.isImplicit && this.includesDeclaration(node)) retained.push(this.visit(node, context))
+    }
+    return this.flatten(retained)
   }
 
   private expression(node: Ast | undefined, context: Context): any {
@@ -160,6 +258,14 @@ export class ClangUastConverter {
       const padding: any = this.attach(UAST.noop(), node)
       padding._meta.bitfield = { unnamed: true, width: this.expression(values[0], context), type: this.type(node.type?.qualType) }
       return padding
+    }
+    if (node.kind === 'VarDecl' && !node.storageClass && node.id && initializer && context.fixedPointers &&
+        /\*\s*const$/.test(canonicalType(node))) {
+      const original = beforeUpcast(initializer)
+      const source = this.destructionRecord(pointeeType(canonicalType(original)), context)
+      if (source && (source.final || original.kind === 'CXXNewExpr' && !original.isArray)) {
+        context.fixedPointers.set(node.id, source)
+      }
     }
     const decl = UAST.variableDeclaration(this.identifier(node.name || '_', node, node.id),
       initializer ? this.expression(initializer, context) : null, false, this.type(node.type?.desugaredQualType || node.type?.qualType))
@@ -206,6 +312,33 @@ export class ClangUastConverter {
     return { ...body, inner: top }
   }
 
+  /** Recognize a direct reference to this->field[index], including a pointer view of void storage. */
+  private indexAccessor(node: Ast, body: Ast): void {
+    if (!node.id) return
+    const fields = this.subscriptOwnerFields.get(node.id) || this.subscriptOwnerFields.get(node.previousDecl)
+    if (!fields) return
+    if (body.inner?.length !== 1 || body.inner[0].kind !== 'ReturnStmt') return
+    const subscript = body.inner[0].inner?.[0]
+    if (subscript?.kind !== 'ArraySubscriptExpr' || subscript.valueCategory !== 'lvalue') return
+    const unwrap = (expr?: Ast): Ast | undefined => {
+      while (expr && expr.inner?.length === 1) {
+        if (/\bvolatile\b/.test(expr.type?.qualType || '')) return undefined
+        const implicit = expr.kind === 'ImplicitCastExpr' && ['LValueToRValue', 'ArrayToPointerDecay', 'NoOp'].includes(expr.castKind)
+        const pointerView = ['CStyleCastExpr', 'CXXStaticCastExpr', 'CXXReinterpretCastExpr'].includes(expr.kind || '') &&
+          expr.castKind === 'BitCast' && /^(?:const )?void\s*\*$/.test(expr.inner[0].type?.qualType || '')
+        if (expr.kind !== 'ParenExpr' && !implicit && !pointerView) break
+        expr = expr.inner[0]
+      }
+      return expr
+    }
+    const field = unwrap(subscript.inner?.[0]), index = unwrap(subscript.inner?.[1])
+    const params = node.inner?.filter(child => child.kind === 'ParmVarDecl')
+    if (field?.kind !== 'MemberExpr' || !field.name || !fields.has(field.referencedMemberDecl) || field.inner?.[0]?.kind !== 'CXXThisExpr') return
+    if (params?.length !== 1 || !params[0].id || index?.kind !== 'DeclRefExpr' || index.referencedDecl?.id !== params[0].id) return
+    this.subscriptFields.set(node.id, field.name)
+    if (node.previousDecl) this.subscriptFields.set(node.previousDecl, field.name)
+  }
+
   private function(node: Ast, context: Context): any {
     const children = node.inner || []
     const previous = this.parameterDefaults.get(node.previousDecl)
@@ -221,9 +354,14 @@ export class ClangUastConverter {
       prototype._meta.prototype = node.name
       return prototype
     }
+    if (node.name === 'operator[]') this.indexAccessor(node, body)
     const pending = [body]
+    const localTypes = new Set(context.localTypes)
     while (pending.length) {
       const statement = pending.pop()!
+      if (statement.kind === 'UsingDirectiveDecl') localTypes.add('*')
+      else if (['CXXRecordDecl', 'EnumDecl', 'TypeAliasDecl', 'TypedefDecl', 'UsingDecl', 'NamespaceAliasDecl'].includes(statement.kind || ''))
+        localTypes.add(statement.name?.split('::').at(-1) || '*')
       if (statement.kind === 'LabelStmt' && statement.declId) {
         this.labels.set(statement.declId, statement.name || '_')
         const offset = this.begins(statement)
@@ -235,7 +373,7 @@ export class ClangUastConverter {
     const trailingReturn = functionType.lastIndexOf(' -> ')
     const returnType = node.kind === 'CXXConstructorDecl' || node.kind === 'CXXDestructorDecl'
       ? 'void' : trailingReturn >= 0 ? functionType.slice(trailingReturn + 4) : functionType.split(' (')[0]
-    let functionBody = this.statement(this.lowerSimpleBackedges(body), { ...context, inFunction: true })
+    let functionBody = this.statement(this.lowerSimpleBackedges(body), { ...context, inFunction: true, localTypes, fixedPointers: new Map() })
     const initializers = children.filter(child => child.kind === 'CXXCtorInitializer')
     if (initializers.length) {
       const statements = initializers.map(initializer => {
@@ -247,6 +385,47 @@ export class ClangUastConverter {
           return this.attach(UAST.expressionStatement(UAST.assignmentExpression(
             UAST.memberAccess(UAST.thisExpression(), this.identifier(initializer.anyInit.name, initializer), false), value, '=', false,
           )), initializer.inner?.[0] || node)
+        }
+        const owner = context.scopes.join('::')
+        const base = this.directBases.get(owner)
+        if (initializer.delegatingInit && input?.constructionKind === 'delegating' && !input.zeroing && value.type === 'NewExpression') {
+          const symbol = this.constructorSymbols.get(owner)?.get(input.ctorType?.qualType)
+          if (symbol) {
+            const member = UAST.memberAccess(UAST.thisExpression(), UAST.identifier('_CTOR_'), false)
+            member._meta.clangConstructorSymbol = symbol
+            const call = this.attach(UAST.callExpression(member, value.arguments), input)
+            return this.attach(UAST.expressionStatement(call), input)
+          }
+        }
+        if (initializer.baseInit && base && input?.kind === 'CXXConstructExpr' &&
+            input.constructionKind === 'non-virtual base' && value.type === 'NewExpression') {
+          const signature = input.ctorType?.qualType
+          // Value initialization may zero fields even when the default ctor is trivial.
+          if (this.trivialDefaults.has(base) && !input.zeroing && !value.arguments.length && signature?.startsWith('void ()')) {
+            const noop = this.attach(UAST.noop(), input)
+            noop._meta.clangTrivialBaseConstructor = base
+            return noop
+          }
+          const fields = this.zeroFields.get(base)
+          if (input.zeroing && fields && !value.arguments.length && signature?.startsWith('void ()')) {
+            const writes = fields.map(field => {
+              const target = UAST.memberAccess(UAST.thisExpression(), this.identifier(field.name, input), false)
+              const zero = field.type.endsWith('*') ? UAST.literal(null, 'null') :
+                /\bbool$/.test(field.type) ? UAST.literal(false, 'boolean') : UAST.literal(0, 'number')
+              return this.attach(UAST.expressionStatement(this.attach(UAST.assignmentExpression(target, zero, '=', false), input)), input)
+            })
+            const block = this.attach(UAST.scopedStatement(writes), input)
+            block._meta.clangZeroInitializedBase = base
+            return block
+          }
+          const target = this.constructorSymbols.get(base)?.get(signature)
+          if (!input.zeroing && target) {
+            const member = UAST.memberAccess(UAST.superExpression(), UAST.identifier('_CTOR_'), false)
+            member._meta.clangBaseConstructor = base
+            member._meta.clangConstructorSymbol = target
+            const call = this.attach(UAST.callExpression(member, value.arguments), input)
+            return this.attach(UAST.expressionStatement(call), input)
+          }
         }
         this.unsupported.set('base_or_delegating_constructor', (this.unsupported.get('base_or_delegating_constructor') || 0) + 1)
         return this.attach(UAST.expressionStatement(value), initializer.inner?.[0] || node)
@@ -265,7 +444,11 @@ export class ClangUastConverter {
     result._meta.languageLinkage = context.languageLinkage
     if (node.kind === 'CXXConstructorDecl') result._meta.isConstructor = true
     if (node.kind === 'CXXDestructorDecl') result._meta.isDestructor = true
-    if (node.virtual) this.unsupported.set('cpp_virtual_dispatch', (this.unsupported.get('cpp_virtual_dispatch') || 0) + 1)
+    const fixedVirtual = this.fixedVirtuals.has(node.id!) || this.fixedVirtuals.has(node.previousDecl)
+    if (node.virtual || fixedVirtual || children.some(child => child.kind === 'OverrideAttr')) {
+      result._meta.clangVirtual = { dispatch: fixedVirtual ? 'final' : 'dynamic', symbol: node.mangledName }
+      if (node.virtual && !fixedVirtual) this.unsupported.set('cpp_virtual_dispatch', (this.unsupported.get('cpp_virtual_dispatch') || 0) + 1)
+    }
     return result
   }
 
@@ -280,6 +463,8 @@ export class ClangUastConverter {
   }
 
   private record(node: Ast, context: Context): any {
+    const rootId = this.recordRoots.get(node.previousDecl) || node.previousDecl || node.id
+    if (node.id && rootId) this.recordRoots.set(node.id, rootId)
     if (!node.completeDefinition) return this.attach(UAST.noop(), node)
     const arguments_ = (node.inner || []).filter(child => child.kind === 'TemplateArgument').map(child => child.type?.qualType ?? child.value ?? '?')
     const name = (node.name || 'anonymous_record') + (arguments_.length ? '<' + arguments_.join(',') + '>' : '')
@@ -287,35 +472,107 @@ export class ClangUastConverter {
     this.recordFields.set([...context.scopes, name].join('::'), fields)
     this.recordFields.set(name, fields)
     const scopes = [...context.scopes, name]
+    const finalClass = node.inner?.some(child => child.kind === 'FinalAttr') === true
+    if (!node.bases?.length) {
+      for (const method of node.inner || []) {
+        if (method.virtual && method.id && (finalClass || method.inner?.some(attr => attr.kind === 'FinalAttr')))
+          this.fixedVirtuals.add(method.id)
+      }
+    }
+    if (!context.inFunction && node.kind === 'CXXRecordDecl' && node.definitionData?.dtor) {
+      const dtors = (node.inner || []).filter(child => child.kind === 'CXXDestructorDecl')
+      const candidate = dtors.length === 1 ? dtors[0] : undefined
+      const method = candidate && candidate.mangledName ? { id: candidate.id, name: candidate.name,
+        mangledName: candidate.mangledName, type: candidate.type } : undefined
+      const simpleMembers = (node.inner || []).filter(child => child.kind === 'FieldDecl').every(field => {
+        const type = canonicalType(field).replace(/(?:\[\d+\])+$/, '').trim()
+        return isArithmetic(type) || /[*&]$/.test(type)
+      })
+      const children = node.inner || []
+      const blockers = children.filter(c => c.name && /(?:Decl|Template)$/.test(c.kind || '')).map(c => c.name!)
+      if (children.some(c => c.kind === 'UsingDirectiveDecl' || c.kind === 'UsingDecl')) blockers.push('*')
+      const owner = scopes.join('::')
+      this.destruction.set(owner, { owner, trivial: !!node.definitionData.dtor.trivial, method, simpleMembers,
+        implicitBody: !!candidate?.isImplicit || candidate?.explicitlyDefaulted === 'default',
+        virtual: !!candidate?.virtual, final: finalClass || !!candidate?.inner?.some(c => c.kind === 'FinalAttr'),
+        hasBases: !!node.bases?.length, lookupBlockers: new Set(blockers),
+        plainLayout: !children.some(c => c.kind === 'FieldDecl' || c.kind?.endsWith('Attr') && c.kind !== 'FinalAttr'),
+        declaresDeallocator: children.some(c => c.name === 'operator delete' || c.kind === 'UsingDecl') })
+    }
     for (const field of (node.inner || []).filter(child => child.kind === 'FieldDecl' && child.hasInClassInitializer)) {
       const initializer = field.inner?.filter(child => !child.kind?.endsWith('Attr')).at(-1)
       if (field.id && initializer) this.fieldDefaults.set(field.id, { node: initializer, context: { ...context, scopes } })
     }
     const result: any = this.attach(UAST.classDefinition(this.identifier(name, node, node.id), [], []), node)
     const owner = { ast: result, scopes }
+    if (rootId) this.records.set(rootId, owner)
     if (node.id) this.records.set(node.id, owner)
     if (node.previousDecl) this.records.set(node.previousDecl, owner)
-    result.body.push(...this.declarations(node.inner || [], { ...context, scopes }))
+
     result._meta.kind = node.tagUsed || 'class'
     result._meta.qualifiedName = [...context.scopes, name].join('::')
+    const declaredMembers = (node.inner || []).filter(child => !child.isImplicit &&
+      ['FieldDecl', 'CXXMethodDecl'].includes(child.kind || '') && child.name)
     if (node.bases?.length) {
       result._meta.clangBases = node.bases.map((base: any) => ({ type: base.type?.qualType, access: base.access, isVirtual: base.isVirtual }))
       const base = node.bases[0]
       const baseType = (base.type?.desugaredQualType || base.type?.qualType || '').replace(/^(?:struct|class)\s+/, '')
       const candidates = [...context.scopes.map((_, i) => context.scopes.slice(0, context.scopes.length - i).join('::') + '::' + baseType), baseType]
       const known = candidates.find(name => this.recordMembers.has(name))
-      const members = (node.inner || []).filter(child => ['FieldDecl', 'CXXMethodDecl'].includes(child.kind || '')).map(child => child.name)
-      const hidesMember = known && members.some(name => name && this.recordMembers.get(known)!.has(name))
+      const hidesMember = known && declaredMembers.some(child => child.name && this.recordMembers.get(known)!.has(child.name) &&
+        !(child.kind === 'CXXMethodDecl' && this.virtualMethods.get(known)?.has(child.name + '|' + child.type?.qualType)))
       if (node.bases.length === 1 && !base.isVirtual && known && !hidesMember && !context.inFunction) {
+        this.directBases.set(scopes.join('::'), known)
         result.supers = [this.identifier(known, node)]
         result._meta.clangInheritance = 'single_nonvirtual'
-      } else this.unsupported.set('cpp_baseclass_semantics', (this.unsupported.get('cpp_baseclass_semantics') || 0) + 1)
+      } else {
+        result._meta.clangInheritanceGap = node.bases.length > 1 ? 'multiple_bases' : base.isVirtual ? 'virtual_base' :
+          !known ? 'unresolved_base' : hidesMember ? 'hidden_member' : 'local_class'
+        this.unsupported.set('cpp_baseclass_semantics', (this.unsupported.get('cpp_baseclass_semantics') || 0) + 1)
+      }
     }
-    const members = new Set<string>((node.inner || []).filter(child => ['FieldDecl', 'CXXMethodDecl'].includes(child.kind || '') && child.name).map(child => child.name!))
-    if (!node.bases?.length || result._meta.clangInheritance) {
+    if (!context.inFunction && (!node.bases?.length || result._meta.clangInheritance)) {
+      const members = new Set<string>(declaredMembers.map(child => child.name!))
       for (const base of result.supers) for (const member of this.recordMembers.get(base.name) || []) members.add(member)
-      this.recordMembers.set([...context.scopes, name].join('::'), members)
+      const virtuals = new Set<string>(this.virtualMethods.get(this.directBases.get(scopes.join('::')) || ''))
+      for (const child of node.inner || []) {
+        if (child.kind === 'CXXMethodDecl' && child.virtual) virtuals.add(child.name + '|' + child.type?.qualType)
+      }
+      this.virtualMethods.set(scopes.join('::'), virtuals)
+      // Clang's construction expression records the selected function type. Only bind it
+      // when it identifies a unique ordinary constructor in this exact base class.
+      const symbols = new Map<string, string | undefined>()
+      const hasConstructorTemplate = node.inner?.some(child => child.kind === 'FunctionTemplateDecl' &&
+        child.inner?.some(decl => decl.kind === 'CXXConstructorDecl'))
+      if (!hasConstructorTemplate) {
+        for (const ctor of node.inner || []) {
+          if (ctor.kind !== 'CXXConstructorDecl' || ctor.isImplicit || !ctor.type?.qualType) continue
+          const signature = ctor.type.qualType
+          const unsupported = symbols.has(signature) || ctor.explicitlyDefaulted || ctor.explicitlyDeleted
+          symbols.set(signature, unsupported ? undefined : ctor.mangledName)
+        }
+      }
+      this.constructorSymbols.set(scopes.join('::'), symbols)
+      if (node.definitionData?.defaultCtor?.trivial) {
+        const owner = scopes.join('::')
+        this.trivialDefaults.add(owner)
+        const fields = (node.inner || []).filter(child => child.kind === 'FieldDecl')
+        if (!node.bases?.length && node.tagUsed !== 'union' && fields.every(field => field.name &&
+          !field.isBitfield && !field.hasInClassInitializer && (isArithmetic(canonicalType(field)) || canonicalType(field).endsWith('*')))) {
+          this.zeroFields.set(owner, fields.map(field => ({ name: field.name!, type: canonicalType(field) })))
+        }
+      }
+      this.recordMembers.set(scopes.join('::'), members)
     }
+    if (!node.bases?.length) {
+      const fields = new Set<string>(declaredMembers.filter(child => child.kind === 'FieldDecl' && child.id).map(child => child.id!))
+      for (const child of declaredMembers) {
+        if (child.kind === 'CXXMethodDecl' && child.name === 'operator[]' && child.id &&
+            !child.virtual && !/\bvolatile\b/.test(child.type?.qualType || '') &&
+            /&\s*\(/.test(child.type?.qualType || '')) this.subscriptOwnerFields.set(child.id, fields)
+      }
+    }
+    result.body.push(...this.declarations(node.inner || [], { ...context, scopes }))
     return result
   }
 
@@ -507,12 +764,12 @@ export class ClangUastConverter {
   }
 
   private dependentIdentifier(node: Ast): any {
-    const text = this.text(node)
-    const name = node.name || text.split('::').at(-1)?.replace(/<.*$/, '') || '_'
+    const spelling = this.text(node)
+    const { name, qualifier, argumentsText } = dependentSpelling(spelling, node.name)
     const id = this.identifier(name, node)
-    const qualifier = text.slice(0, text.lastIndexOf('::'))
-    if (text.includes('::')) id._meta.qualifier = qualifier
+    if (qualifier !== undefined) id._meta.qualifier = qualifier
     id._meta.clangDependent = true
+    id._meta.clangLookup = { spelling, argumentsText, usesADL: node.usesADL }
     if (node.lookups) id._meta.clangCandidates = node.lookups.map((candidate: any) => ({ id: candidate.id, name: candidate.name, kind: candidate.kind }))
     this.unsupported.set('dependent_name_resolution', (this.unsupported.get('dependent_name_resolution') || 0) + 1)
     return id
@@ -535,14 +792,13 @@ export class ClangUastConverter {
       const simpleReferences = /^\[\s*(?:&|&\s*\w+(?:\s*,\s*&\s*\w+)*)\s*\]/.test(this.text(node)) &&
         fields.length === captures.length && fields.every(field => /&$/.test(field.type?.qualType || '')) &&
         captures.every(capture => capture.kind === 'DeclRefExpr')
-      const scalar = (spelling: string) => /^(?:(?:const|volatile|signed|unsigned)\s+)*(?:char|short|int|long|long long|long double|float|double|bool)(?: int)?$/.test(spelling)
       const references = captures.map(capture => {
         let value = capture
         while (value.kind === 'ImplicitCastExpr' && value.inner?.length === 1) value = value.inner[0]
         return value.kind === 'DeclRefExpr' ? value.referencedDecl : undefined
       })
       const simpleValues = /^\[\s*(?:=|[a-zA-Z_]\w*(?:\s*,\s*[a-zA-Z_]\w*)*)\s*\]/.test(this.text(node)) &&
-        fields.length === captures.length && fields.every(field => scalar(field.type?.desugaredQualType || field.type?.qualType || '')) &&
+        fields.length === captures.length && fields.every(field => isArithmetic(field.type?.desugaredQualType || field.type?.qualType || '')) &&
         references.every(reference => reference?.name && reference.name !== 'this')
       if (simpleReferences) result._meta.cppLambda.captureSemantics = 'lexical_reference'
       else if (simpleValues) {
@@ -552,6 +808,179 @@ export class ClangUastConverter {
       } else this.unsupported.set('lambda_capture_semantics', (this.unsupported.get('lambda_capture_semantics') || 0) + 1)
     }
     return this.attach(result, node)
+  }
+
+  private allocationExpression(node: Ast, context: Context): any {
+    const children = node.inner || []
+    const firstInit = node.isArray ? 1 : 0
+    // Clang orders the bound and initializer before the placement arguments. In C++17
+    // allocation precedes initialization, so visit placement operands before the initializer.
+    const init = children[firstInit]
+    const hasInit = !!init && (!!node.initStyle || init.kind === 'CXXConstructExpr')
+    const placement = node.isPlacement ? children.slice(firstInit + Number(hasInit)) : []
+    const plainCtor = !node.isArray && !node.isPlacement && hasInit && init.kind === 'CXXConstructExpr'
+    const element = (node.type?.qualType || '_').replace(/\s*\*$/, '')
+    const ordered = [...children.slice(0, firstInit), ...placement, ...(hasInit ? [init] : [])]
+    // Keep unfamiliar frontend shapes intact and partial.
+    const mapped = ordered.length === children.length
+    const allocation = node.operatorNewDecl
+    const info = { array: !!node.isArray, placement: !!node.isPlacement, operator: allocation?.name,
+      declarationId: allocation?.id, signature: allocation?.type?.qualType, initStyle: node.initStyle || 'default',
+      failureCleanup: node.operatorDeleteDecl?.name }
+    if (mapped && !node.isArray && !hasInit && (isArithmetic(element) || element.endsWith('*')) &&
+        allocation?.kind === 'FunctionDecl' && allocation.name === 'operator new') {
+      // Default-initializing a scalar performs no store. The reserved global placement
+      // overload returns its void* argument unchanged; a replaceable allocator must still be called.
+      const signature = info.signature || ''
+      const identity = placement.length === 1 && /^void \*\([^,]+, void \*\) noexcept$/.test(signature)
+      const direct = !node.isPlacement && /^void \*\([^(),*]+\)$/.test(signature)
+      if (identity || direct) {
+        let address
+        if (identity) address = this.expression(placement[0], context)
+        else {
+          const size = this.attach(UAST.callExpression(this.identifier('sizeof', node), []), node)
+          size._meta.typeArguments = [this.type(element)]
+          address = this.attach(UAST.callExpression(this.identifier(allocation.name, node, allocation.id), [size]), node)
+        }
+        const cast = this.attach(UAST.castExpression(address, this.type(node.type?.qualType)), node)
+        cast._meta.clangAllocation = { ...info, lowering: identity ? 'placement_address' : 'allocator_call',
+          operandRoles: identity ? ['placement'] : [] }
+        return cast
+      }
+    }
+    const result: any = plainCtor ? this.expression(init, context) : this.attach(UAST.newExpression(
+      this.identifier(element, node), (mapped ? ordered : children).map(child => this.expression(child, context)),
+    ), node)
+    result._meta.clangAllocation = { ...info, operandRoles: plainCtor ? result.arguments.map(() => 'constructor_argument') :
+        mapped ? [...(node.isArray ? ['bound'] : []), ...placement.map(() => 'placement'), ...(hasInit ? ['initializer'] : [])] : undefined }
+    this.unsupported.set('cpp_allocation_semantics', (this.unsupported.get('cpp_allocation_semantics') || 0) + 1)
+    return this.attach(result, node)
+  }
+
+  /** Resolve unqualified record names through class scope only when no member or base hides the name. */
+  private destructionRecord(type: string, context: Context): Destruction | undefined {
+    if (type.startsWith('::')) return this.destruction.get(type.slice(2))
+    const first = type.split('::')[0]
+    if (context.localTypes?.has(first) || context.localTypes?.has('*')) return undefined
+    const scopes = [...context.scopes]
+    while (true) {
+      const key = [...scopes, type].join('::')
+      const imported = this.importedRecords.get(key)
+      const record = this.destruction.get(key) || (imported ? this.destruction.get(this.records.get(this.recordRoots.get(imported) || imported)?.scopes.join('::') || '') : undefined)
+      if (record || imported) return record
+      const owner = this.destruction.get(scopes.join('::'))
+      if (!owner) return undefined
+      if (first === scopes.at(-1) && type === first) return owner
+      let enclosing: Destruction | undefined = owner
+      while (enclosing) {
+        if (enclosing.lookupBlockers.has(first) || enclosing.lookupBlockers.has('*')) return undefined
+        if (!enclosing.hasBases) break
+        enclosing = this.destruction.get(this.directBases.get(enclosing.owner) || '')
+        if (!enclosing) return undefined
+      }
+      scopes.pop()
+    }
+  }
+
+  private destructionChain(record?: Destruction): Destruction[] | undefined {
+    if (!record) return undefined
+    const chain = [record]
+    while (record.hasBases) {
+      record = this.destruction.get(this.directBases.get(record.owner) || '')
+      if (!record || chain.includes(record)) return undefined
+      chain.push(record)
+    }
+    return chain
+  }
+
+  /** Keep unresolved deletes as operations too, so flattening a block cannot erase them. */
+  private deleteExpression(node: Ast, context: Context): any {
+    const input = node.inner?.[0]
+    const pointerType = input ? canonicalType(input) : ''
+    const element = pointeeType(pointerType)
+    const op = node.operatorDeleteDecl
+    const info = { array: !!node.isArray, global: !!node.isGlobal, pointerType, operator: op?.name,
+      declarationId: op?.id, signature: op?.type?.qualType }
+    const record = this.destructionRecord(element, context)
+    let chain = this.destructionChain(record)
+    const virtual = !!record?.virtual || !!chain?.some(r => r.virtual)
+    const trivial = isArithmetic(element) || element.endsWith('*') || record?.trivial
+    let exact = !!record?.final
+    let operand = input
+    let allocatedType = element
+    if (!node.isArray && virtual && !exact && input) {
+      // Follow compiler-proven upcasts only. Keep the original complete-object pointer for
+      // both the destructor receiver and sized delete. User conversions can have side effects.
+      const original = beforeUpcast(input)
+      const read = original.kind === 'ImplicitCastExpr' && original.castKind === 'LValueToRValue' ? original.inner?.[0] : original
+      const fromLocal = read?.kind === 'DeclRefExpr' ? context.fixedPointers?.get(read.referencedDecl?.id) : undefined
+      const derived = fromLocal || this.destructionRecord(pointeeType(canonicalType(original)), context)
+      const path = this.destructionChain(derived)
+      if ((fromLocal || derived?.final || original.kind === 'CXXNewExpr' && !original.isArray) && record && path?.includes(record) &&
+          (derived === record || path.every(r => r.plainLayout && !r.declaresDeallocator))) {
+        exact = true
+        chain = path
+        operand = fromLocal ? input : original
+        allocatedType = fromLocal ? fromLocal.owner : pointeeType(canonicalType(original))
+      }
+    }
+    const modeled = chain && (!virtual || exact) && chain.every(r => r.trivial || r.implicitBody || r.method)
+    const calls = chain && modeled ? chain.filter(r => !r.trivial && !r.implicitBody) : []
+    const signature = op?.type?.qualType || ''
+    const unsized = /^void \(void \*\)(?: noexcept)?$/.test(signature)
+    const sized = /^void \(void \*, (?:unsigned (?:int|long|long long)|(?:std::)?size_t)\)(?: noexcept)?$/.test(signature)
+    // Array cookies, destroying delete and aligned/class-specific deallocators need their own ABI lowering.
+    const ordinary = (!node.isArray || isArithmetic(element) || element.endsWith('*')) && op?.kind === 'FunctionDecl' && (unsized || (!node.isArray && sized)) && op.id
+    if (!ordinary || !(trivial || !node.isArray && modeled)) {
+      const result = this.attach(UAST.unaryExpression('delete', this.expression(input, context), false), node)
+      let nullable = input
+      while (nullable?.inner?.length === 1 && (nullable.kind === 'ParenExpr' ||
+        ['ImplicitCastExpr', 'CStyleCastExpr', 'CXXStaticCastExpr'].includes(nullable.kind || '') && nullable.castKind === 'NoOp'))
+        nullable = nullable.inner[0]
+      if (ordinary && (nullable?.castKind === 'NullToPointer' || nullable?.kind === 'CXXNullPtrLiteralExpr')) {
+        result._meta.clangDelete = { ...info, lowering: 'null_operand' }
+        return result
+      }
+      result._meta.clangDelete = { ...info, lowering: 'opaque', staticOwner: record?.owner,
+        ...(virtual && !exact && !node.isArray ? { dispatch: 'virtual', target: 'dynamic_type_required' } : {}) }
+      this.unsupported.set('cpp_delete_semantics', (this.unsupported.get('cpp_delete_semantics') || 0) + 1)
+      return result
+    }
+    let pointer = this.expression(operand, context)
+    let savedType = operand ? canonicalType(operand) : pointerType
+    if (operand === input && exact && chain?.[0] !== record) {
+      // Reload the immutable variable; its initializer may call user code and must never run twice.
+      savedType = allocatedType + ' *'
+      pointer = this.attach(UAST.castExpression(pointer, this.type(savedType)), input!)
+    }
+    const temp = () => this.attach(UAST.identifier('<delete.pointer>'), node)
+    const saved = this.attach(UAST.variableDeclaration(temp(), pointer, false, this.type(savedType)), node)
+    const effects = []
+    for (const part of calls) {
+      const destructor = part.method!
+      const member = UAST.memberAccess(temp(), this.identifier(destructor.name!, node, destructor.id), false)
+      member._meta.clangDestructorSymbol = destructor.mangledName
+      member._meta.clangDestructorOwner = part.owner
+      effects.push(this.attach(UAST.expressionStatement(this.attach(UAST.callExpression(member, []), node)), node))
+    }
+    const args = [temp()]
+    if (sized) {
+      const size = this.attach(UAST.callExpression(this.identifier('sizeof', node), []), node)
+      size._meta.typeArguments = [this.type(allocatedType)]
+      args.push(size)
+    }
+    const release = this.attach(UAST.callExpression(this.identifier(op.name, node, op.id), args), node)
+    release._meta.clangDeallocation = true
+    effects.push(this.attach(UAST.expressionStatement(release), node))
+    const guard = this.attach(UAST.ifStatement(temp(), this.attach(UAST.scopedStatement(effects), node), null), node)
+    guard._meta.clangDeleteGuard = true
+    const result = this.attach(UAST.sequence([saved, guard]), node)
+    result._meta.clangDelete = { ...info, lowering: 'guarded_calls', ...(virtual ? { dispatch: 'exact', completeObject: chain?.[0].owner } : {}) }
+    if (!trivial && chain?.some(r => !r.simpleMembers || !r.implicitBody && !r.trivial &&
+        (!r.method?.type?.qualType?.endsWith(' noexcept') && !r.method?.type?.qualType?.endsWith(' noexcept(true)')))) {
+      this.unsupported.set('cpp_delete_semantics', (this.unsupported.get('cpp_delete_semantics') || 0) + 1)
+    }
+    return result
   }
 
   private unsupportedNode(node: Ast): any {
@@ -678,10 +1107,12 @@ export class ClangUastConverter {
       case 'StmtExpr': {
         const result: any = this.attach(UAST.sequence((children[0]?.inner || []).map(child => this.visit(child, context))), node)
         result._meta.gnuStatementExpression = true
-        result._meta.clangStatementExpression = { scope: 'lexical', resultType: node.type?.qualType,
+        result._meta.clangStatementExpression = { scope: 'lexical', resultType: node.type?.qualType, yieldsValue: canonicalType(node) !== 'void',
           valueCategory: node.valueCategory }
         if (this.options.language === 'cpp') {
-          this.unsupported.set('cpp_statement_expression_lifetime', (this.unsupported.get('cpp_statement_expression_lifetime') || 0) + 1)
+          const trivial = hasTrivialStatementLifetime(node)
+          result._meta.clangStatementExpression.lifetime = trivial ? 'trivial' : 'unmodeled'
+          if (!trivial) this.unsupported.set('cpp_statement_expression_lifetime', (this.unsupported.get('cpp_statement_expression_lifetime') || 0) + 1)
         }
         return result
       }
@@ -715,9 +1146,14 @@ export class ClangUastConverter {
       case 'CXXDependentScopeMemberExpr':
       case 'UnresolvedMemberExpr': {
         const base = children[0] ? this.expression(children[0], context) : UAST.thisExpression()
-        const member = this.identifier(node.member || node.name || this.text(node).split(/::|->|\./).at(-1) || '_', node)
+        const spelling = this.text(node)
+        const { name, argumentsText } = dependentSpelling(spelling, node.member || node.name)
+        const member = this.identifier(name, node)
         const expression: any = this.attach(UAST.memberAccess(base, member, false), node)
         expression._meta.clangDependent = true
+        if (node.isArrow) expression._meta.pointer = true
+        expression._meta.clangLookup = { spelling, argumentsText, implicitReceiver: !children[0],
+          templateArguments: node.explicitTemplateArgs?.map((arg: Ast) => ({ spelling: this.text(arg), type: arg.type?.qualType })) }
         this.unsupported.set('dependent_member_resolution', (this.unsupported.get('dependent_member_resolution') || 0) + 1)
         return expression
       }
@@ -833,11 +1269,11 @@ export class ClangUastConverter {
             children[0]?.type?.qualType === '<dependent type>'
           if (!UAST.isLVal(left) && left.type !== 'DereferenceExpression' && !referenceCall && !dependentTarget) return this.unsupportedNode(node)
           if (dependentTarget) this.unsupported.set('dependent_assignment_target', (this.unsupported.get('dependent_assignment_target') || 0) + 1)
-          if (referenceCall) this.unsupported.set('assignment_location_semantics', (this.unsupported.get('assignment_location_semantics') || 0) + 1)
           // Clang lvalues include dereferences and reference-returning calls beyond the shared LVal schema.
           // Preserve both operands while reporting unresolved write-back semantics for calls.
           const assignment = UAST.assignmentExpression(UAST.identifier('_'), right, node.opcode, false)
           assignment.left = left
+          if (referenceCall) this.referenceAssignments.push(assignment)
           if (dependentTarget) assignment._meta = { ...assignment._meta, clangDependentAssignment: true }
           return this.attach(assignment, node)
         }
@@ -883,7 +1319,19 @@ export class ClangUastConverter {
           return this.attach(UAST.callExpression(this.expression(children[1], context), this.arguments(children.slice(2), context, this.calleeReference(children[0]).id || '')), node)
         }
         const reference = this.calleeReference(children[0])
-        return this.attach(UAST.callExpression(callee, this.arguments(children.slice(1), context, reference.id || '', reference.kind === 'CXXMethodDecl' ? -1 : 0)), node)
+        const args = this.arguments(children.slice(1), context, reference.id || '', reference.kind === 'CXXMethodDecl' ? -1 : 0)
+        const call = this.attach(UAST.callExpression(callee, args), node)
+        if (callee.name === 'operator[]' && reference.kind === 'CXXMethodDecl' && call.arguments.length === 2) {
+          this.subscriptCalls.push(call)
+          const receiver = canonicalType(children[1]).replace(/^const /, '')
+          const container = /^std::(?:__\w+::)?(vector|basic_string)<([^<>,]+)>$/.exec(receiver)
+          const element = container?.[2].trim()
+          if (container && element && element !== 'bool' && node.valueCategory === 'lvalue' &&
+              (canonicalType(node) === element || canonicalType(node) === 'const ' + element || canonicalType(node) === element + ' const')) {
+            call._meta.clangContainerCandidate = container[1]
+          }
+        }
+        return call
       }
       case 'MemberExpr': {
         const result: any = this.attach(UAST.memberAccess(this.expression(children[0], context), this.identifier(node.name || '_', { ...node, range: { begin: node.range?.end, end: node.range?.end } }, node.referencedMemberDecl), false), node)
@@ -891,21 +1339,8 @@ export class ClangUastConverter {
         return result
       }
       case 'ArraySubscriptExpr': return this.attach(UAST.memberAccess(this.expression(children[0], context), this.expression(children[1], context), true), node)
-      case 'CXXNewExpr': {
-        const construction = children.length === 1 && children[0].kind === 'CXXConstructExpr' ? children[0] : undefined
-        const result: any = construction ? this.expression(construction, context) : this.attach(UAST.newExpression(
-          this.identifier((node.type?.qualType || '_').replace(/\s*\*$/, ''), node), children.map(child => this.expression(child, context)),
-        ), node)
-        result._meta.clangAllocation = { array: !!node.isArray, placement: !!node.isPlacement, operator: node.operatorNewDecl?.name }
-        this.unsupported.set('cpp_allocation_semantics', (this.unsupported.get('cpp_allocation_semantics') || 0) + 1)
-        return this.attach(result, node)
-      }
-      case 'CXXDeleteExpr': {
-        const result: any = this.attach(UAST.sequence(children.map(child => this.expression(child, context))), node)
-        result._meta.clangDelete = { array: !!node.isArray, operator: node.operatorDeleteDecl?.name }
-        this.unsupported.set('cpp_delete_semantics', (this.unsupported.get('cpp_delete_semantics') || 0) + 1)
-        return result
-      }
+      case 'CXXNewExpr': return this.allocationExpression(node, context)
+      case 'CXXDeleteExpr': return this.deleteExpression(node, context)
       case 'CXXUnresolvedConstructExpr':
       case 'CXXConstructExpr':
       case 'CXXTemporaryObjectExpr': {
@@ -992,7 +1427,28 @@ export class ClangUastConverter {
     }
   }
 
+  observeSubscript(node: Ast): void {
+    const offset = this.begins(node)
+    if (node.id && offset !== undefined && mapOrigin(this.options.sourceMap, this.coordinates.location(offset).line)?.system)
+      this.systemSubscripts.add(node.id)
+  }
+
+  /** The standalone reader supplies complete namespace subtrees, including omitted library headers. */
+  indexLibrarySubscripts(node: Ast): void {
+    if (node.kind === 'CXXMethodDecl' && node.name === 'operator[]') this.observeSubscript(node)
+    if (['NamespaceDecl', 'LinkageSpecDecl', 'ClassTemplateDecl', 'ClassTemplateSpecializationDecl', 'CXXRecordDecl'].includes(node.kind || ''))
+      for (const child of node.inner || []) this.indexLibrarySubscripts(child)
+  }
+
+  private indexImportedRecord(node: Ast, scopes: string[]): void {
+    // Clang's implicit using-shadow references the declaration actually introduced by a using-declaration.
+    const target = node.target
+    if (target?.kind === 'CXXRecordDecl' && target.id && this.includesDeclaration(node))
+      this.importedRecords.set([...scopes, target.name].join('::'), target.id)
+  }
+
   add(node: Ast): void {
+    if (node.kind === 'UsingShadowDecl') this.indexImportedRecord(node, [])
     if (node.isImplicit || !this.includesDeclaration(node)) return
     this.body.push(...this.flatten([this.visit(node)]))
   }
@@ -1006,6 +1462,22 @@ export class ClangUastConverter {
           ...value.context, defaultStack: [...(pending.context.defaultStack || []), key],
         })
       } else this.unsupported.set('CXXDefaultArgExpr', (this.unsupported.get('CXXDefaultArgExpr') || 0) + 1)
+    }
+    for (const call of this.subscriptCalls) {
+      const id = call.callee._meta?.clangDeclarationId
+      const container = this.systemSubscripts.has(id) && call._meta.clangContainerCandidate
+      delete call._meta.clangContainerCandidate
+      const field = this.subscriptFields.get(id)
+      if (!field && !container) continue
+      const [receiver, index] = call.arguments
+      call.callee = { ...UAST.memberAccess(receiver, call.callee, false), loc: call.loc }
+      call.arguments = [index]
+      call._meta.clangIndexedReference = container ? '<std::' + container + '.elements>' : field
+      if (container) call._meta.clangStdSubscript = container
+    }
+    for (const assignment of this.referenceAssignments) {
+      if (assignment.left._meta?.clangIndexedReference && supportsIndexedAssignment(assignment.operator)) continue
+      this.unsupported.set('assignment_location_semantics', (this.unsupported.get('assignment_location_semantics') || 0) + 1)
     }
     const result: any = UAST.compileUnit(this.body, 'php' as any, this.options.languageVersion || (this.options.language === 'c' ? 'c11' : 'c++17'), this.options.sourcefile, '0.0.0')
     result.language = this.options.language
@@ -1027,7 +1499,7 @@ export async function convertClangAstFile(file: string, options: ClangUastOption
     input.on('error', fail)
     parser.on('error', fail)
     parser.on('data', (node: Ast) => {
-      try { converter.add(node) } catch (error) { fail(error as Error) }
+      try { converter.indexLibrarySubscripts(node); converter.add(node) } catch (error) { fail(error as Error) }
     })
     parser.on('end', () => resolve(converter.finish()))
     input.pipe(parser)
