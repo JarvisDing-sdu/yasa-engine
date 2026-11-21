@@ -35,6 +35,7 @@ export interface CompilerMetadata {
 }
 
 export interface CompilerAstConsumer {
+  observeSubscript?(node: AstNode): void
   shouldRetain(node: AstNode): boolean
   consume(node: AstNode): void
 }
@@ -462,6 +463,7 @@ function createAstParser(state: AstReaderState): JsonParser {
     if (typeof this.key !== 'number' || parent.key !== 'inner') return
     if (isAstNode(value)) collectNode(value, parent.value, this.stack, state)
     if (state.consumer && isAstNode(value)) {
+      if (value.kind === 'CXXMethodDecl' && value.name === 'operator[]') state.consumer.observeSubscript?.(value)
       const ancestor = this.stack.find(frame => frame.key === 'inner' && frame.value?.kind && frame.value.kind !== 'TranslationUnitDecl')?.value
       const top = ancestor || value
       // JSON member order is unrestricted. Defer filtering until the active

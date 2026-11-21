@@ -66,6 +66,38 @@ describe('Engine consumption of Clang-produced UAST', function () {
     assert.strictEqual(targets.filter(name => name === 'count').length, 2)
   })
 
+  it('resolves a nonvirtual destructor for an external pointer and skips a known null', () => {
+    for (const [name, operand, expected] of [['external', 'acquire()', true], ['null', 'nullptr', false]] as const) {
+      const { graph } = scan('delete-' + name, `
+        int observed() { return 1; }
+        struct Leaf { ~Leaf() noexcept { observed(); } }; Leaf* acquire();
+        int main() { Leaf* p = ${operand}; delete p; }`, true)
+      const targets = Object.values<any>(graph.edges)
+        .filter(edge => graph.nodes[edge.sourceNodeId]?.funcDef?.name === 'main')
+        .map(edge => graph.nodes[edge.targetNodeId]?.funcDef?.name)
+      assert.strictEqual(targets.includes('~Leaf'), expected, JSON.stringify(targets))
+    }
+  })
+
+  it('calls only the proven leaf and base destructors, skipping both on null', () => {
+    // Out-of-line definitions also exercise declaration-to-definition symbol binding.
+    const { graph } = scan('exact-virtual-destruction', `
+      struct B { virtual ~B() noexcept; }; B::~B() noexcept {}
+      struct Left final:B { ~Left() noexcept; }; Left::~Left() noexcept {}
+      struct Right final:B { ~Right() noexcept; }; Right::~Right() noexcept {}
+      Left* left(); Right* right();
+      void dropLeft(){delete static_cast<B*>(left());}
+      void dropRight(){B* const p=right();delete p;}
+      void dropNull(){delete static_cast<Left*>(nullptr);}
+      int main(){dropLeft();dropRight();dropNull();}`, true)
+    const targets = (caller: string) => Object.values<any>(graph.edges)
+      .filter(e => graph.nodes[e.sourceNodeId]?.funcDef?.name === caller)
+      .map(e => graph.nodes[e.targetNodeId]?.funcDef?.name).filter(n => n?.startsWith('~')).sort()
+    assert.deepStrictEqual(targets('dropLeft'), ['~B','~Left'])
+    assert.deepStrictEqual(targets('dropRight'), ['~B','~Right'])
+    assert.deepStrictEqual(targets('dropNull'), [])
+  })
+
   it('keeps out-of-line overloaded constructors inside their owning class', () => {
     const { graph } = scan('out-of-line-constructors', `
       int target(int input) { return input; }
@@ -99,6 +131,19 @@ describe('Engine consumption of Clang-produced UAST', function () {
       const { sarif } = scan(name, `extern char *getenv(const char *); extern int system(const char *);
         int main(void) { ${body} }`, false)
       assert.strictEqual(sarif.runs.some((run: any) => run.results?.length > 0), expected, name)
+    }
+  })
+
+  it('executes scalar C++ statement expressions with lexical scope and observable writes', () => {
+    for (const [name, body, tainted] of [
+      ['result', 'long result = ({long local = input(); local;}); return system((char*)result);', true],
+      ['shadow', 'long clean = 0; ({long clean = input(); clean;}); return system((char*)clean);', false],
+      ['void', 'long bits = 0; ({bits |= input(); int last = 0;}); return system((char*)bits);', true],
+      ['rhs-first', 'global |= seed(); return system((char*)global);', true],
+    ] as const) {
+      const { sarif } = scan('cpp-statement-' + name, `#include <stdlib.h>
+        long input(){return (long)getenv("USER");} long global=0; long seed(){global=input();return 0;} int main(){${body}}`, true)
+      assert.strictEqual(sarif.runs[0].results.length > 0, tainted, name)
     }
   })
 
@@ -185,6 +230,45 @@ int main(void){${body}}`, false)
     assert.ok(sarif.runs[0].results.length > 0)
   })
 
+  it('preserves the placement address for a default-initialized scalar', () => {
+    const { sarif } = scan('placement-address', `
+      void* operator new(decltype(sizeof(0)), void*) noexcept;
+      extern char* getenv(const char*); extern int system(const char*);
+      int main(){char* text; char** place = new(&text) char*; *place = getenv("USER"); return system(text);}`, true)
+    assert.ok(sarif.runs.some((run: any) => run.results?.length))
+  })
+
+  it('writes and reads the selected standard vector element', () => {
+    for (const [name, index, expected] of [['same', 1, true], ['other', 0, false]] as const) {
+      const { sarif } = scan('vector-element-' + name, `
+        #include <vector>
+        extern char* getenv(const char*); extern int system(const char*);
+        int main(){std::vector<char*> v(2); v[0]=(char*)"safe"; v[1]=getenv("USER"); return system(v[${index}]);}`, true)
+      assert.strictEqual(sarif.runs.some((run: any) => run.results?.length), expected, name)
+    }
+  })
+
+  it('writes and reads individual string characters', () => {
+    for (const [name, index, expected] of [['same', 1, true], ['other', 0, false]] as const) {
+      const { sarif } = scan('string-element-' + name, `
+        #include <string>
+        extern char* getenv(const char*); extern int system(const char*);
+        int main(){std::string text(2,'a'); text[0]='a'; text[1]=getenv("USER")[0];
+          char command[2]={text[${index}],0}; return system(command);}`, true)
+      assert.strictEqual(sarif.runs.some((run: any) => run.results?.length), expected, name)
+    }
+  })
+
+  it('delegates initialization to the selected constructor on the same instance', () => {
+    for (const [name, value, expected] of [['tainted', 'getenv("USER")', true], ['clean', '"safe"', false]] as const) {
+      const { sarif } = scan('delegated-' + name, `
+        extern char *getenv(const char*); extern int system(const char*);
+        struct Owner { const char* text; Owner():Owner(${value}){} Owner(const char* s):text(s){} };
+        int main(){Owner obj; return system(obj.text);}`, true)
+      assert.strictEqual(sarif.runs.some((run: any) => run.results?.length), expected)
+    }
+  })
+
   it('runs the base constructor on the derived receiver', () => {
     for (const [name, init, expected] of [['tainted', 'getenv("USER")', true], ['safe', '"ok"', false]] as const) {
       const { sarif } = scan('base-init-' + name, `#include <stdlib.h>
@@ -193,6 +277,27 @@ int main(void){${body}}`, false)
         int main(){D d(${init});return system(d.v);}`, true)
       assert.strictEqual(sarif.runs[0].results.length > 0, expected, name)
     }
+  })
+
+  it('calls the compiler-selected direct base constructor on the derived object', () => {
+    for (const [label, tag, expected] of [['int', '0', true], ['long', '0L', false]] as const) {
+      const { sarif } = scan('base-overload-' + label, `#include <stdlib.h>
+        struct Base { const char *field; Base(int, const char*); Base(long, const char*); };
+        struct Derived : Base { Derived(const char *arg): Base(${tag}, arg) {} };
+        Base::Base(int, const char *arg):field(arg) {}
+        Base::Base(long, const char *arg):field("safe") {}
+        int main(){Derived d(getenv("USER"));return system(d.field);}`, true)
+      assert.strictEqual(sarif.runs[0].results.length > 0, expected, label)
+    }
+  })
+
+  it('does not execute a different base overload when the selected body is external', () => {
+    const { sarif } = scan('external-base-overload', `#include <stdlib.h>
+      const char *seen = "safe";
+      struct Base {Base(long); Base(int){seen=getenv("USER");}};
+      struct Derived:Base {Derived():Base(0L){}};
+      int main(){Derived d;return system(seen);}`, true)
+    assert.strictEqual(sarif.runs[0].results.length, 0)
   })
 
   it('runs base initialization before the derived constructor body', () => {
@@ -245,12 +350,12 @@ int main(void){${body}}`, false)
   })
 
   it('writes a compound result back after evaluating its right operand', () => {
-    for (const index of [0, 1]) {
-      const { sarif } = scan('indexed-compound-' + index, `#include <stdlib.h>
+    for (const [op, index] of [['+=', 0], ['+=', 1], ['|=', 0], ['|=', 1]] as const) {
+      const { sarif } = scan('indexed-compound-' + op + index, `#include <stdlib.h>
         struct Box {long items[2]; long &operator[](int i){return items[i];}};
         int target=0; long input(){target=1;return (long)getenv("USER");}
         int main(){Box a; a.items[0]=0; a.items[1]=0;
-          a[target]+=input();return system((char*)a.items[${index}]);}`, true)
+          a[target]${op}input();return system((char*)a.items[${index}]);}`, true)
       assert.strictEqual(sarif.runs[0].results.length > 0, index === 1)
     }
   })

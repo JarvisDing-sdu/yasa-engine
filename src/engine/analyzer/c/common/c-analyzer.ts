@@ -159,16 +159,39 @@ class CAnalyzer extends Analyzer {
   private indexedWrite?: { call: any; receiver?: any; index?: any }
 
   override processMemberAccess(scope: any, node: any, state: any): any {
-    const member = super.processMemberAccess(scope, node, state)
+    let member = super.processMemberAccess(scope, node, state)
+    if (node._meta?.clangDestructorOwner && member.vtype !== 'fclos') {
+      // The pointer may originate outside this translation unit. A nonvirtual destructor
+      // has a static target even when the object's field values are unknown.
+      const owner = this.processInstruction(scope, { type: 'Identifier', name: node._meta.clangDestructorOwner }, state)
+      const target = owner?.getMemberValue?.(node.property.name)
+      if (target?.vtype === 'fclos' && target.ast?.fdef?._meta?.clang?.mangledName === node._meta.clangDestructorSymbol) {
+        const bound = lodashCloneWithTag(target)
+        bound._this = member._this
+        member = bound
+      }
+    }
     // Clang gives the selected operator's function type even when runtime argument values
     // no longer distinguish int from long (or a const receiver from a mutable receiver).
     const clang = node.property?._meta?.clang
-    if (node.property?.name !== 'operator[]' || clang?.kind !== 'DeclRefExpr' || !clang.type || member.vtype !== 'fclos') return member
+    const methodSymbol = node._meta?.clangConstructorSymbol || node._meta?.clangDestructorSymbol
+    const indexedCall = node.property?.name === 'operator[]' && clang?.kind === 'DeclRefExpr' && clang.type
+    if (!methodSymbol && !indexedCall) return member
+    if (member.vtype !== 'fclos') return methodSymbol ? new UndefinedValue() : member
     const overloads = member.overloaded?.filter(() => true) || []
-    const matching = overloads.filter((fn: any) => fn._meta?.clang?.type === clang.type)
-    const selected = matching.length === 1 ? matching[0] :
-      matching.find((fn: any) => fn._meta?.clang?.id === node.property._meta.clangDeclarationId)
-    if (!selected || (overloads.length === 1 && selected === member.ast.fdef)) return member
+    let selected
+    if (methodSymbol) {
+      selected = member.ast?.fdef?._meta?.clang?.mangledName === methodSymbol ? member.ast.fdef :
+        overloads.find((fn: any) => fn._meta?.clang?.mangledName === methodSymbol)
+      // The translation unit may contain only the declaration of the selected body.
+      if (!selected) return new UndefinedValue()
+    } else {
+      const matching = overloads.filter((fn: any) => fn._meta?.clang?.type === clang.type)
+      selected = matching.length === 1 ? matching[0] :
+        matching.find((fn: any) => fn._meta?.clang?.id === node.property._meta.clangDeclarationId)
+      if (!selected) return member
+    }
+    if (overloads.length <= 1 && selected === member.ast.fdef && (!overloads.length || selected === overloads[0])) return member
     const bound = lodashCloneWithTag(member)
     bound.ast = selected
     bound.ast.fdef = selected
@@ -516,12 +539,20 @@ class CAnalyzer extends Analyzer {
     }
   }
 
+  override processUnaryExpression(scope: any, node: any, state: any): any {
+    if (!node._meta?.clangDelete) return super.processUnaryExpression(scope, node, state)
+    this.processInstruction(scope, node.argument, state)
+    return new UndefinedValue()
+  }
+
   /** GNU statement expressions yield their last value inside a local block scope. */
   override processSequence(scope: any, node: any, state: any): any {
-    if (!node._meta?.gnuStatementExpression) return super.processSequence(scope, node, state)
+    const deleting = node._meta?.clangDelete?.lowering === 'guarded_calls'
+    if (!deleting && !node._meta?.gnuStatementExpression) return super.processSequence(scope, node, state)
     const start = node.loc?.start
     const block = Scope.createSubScope(`<statement_expression_${start?.line}_${start?.column}>`, scope, 'scope')
-    return super.processSequence(block, node, state)
+    const value = super.processSequence(block, node, state)
+    return deleting || node._meta.clangStatementExpression?.yieldsValue === false ? new UndefinedValue() : value
   }
 
   /**
@@ -533,6 +564,17 @@ class CAnalyzer extends Analyzer {
    */
   override processCallExpression(scope: any, node: any, state: any): any {
     const callee = node?.callee
+    if (node._meta?.clangStdSubscript) {
+      const receiver = this.processInstruction(scope, callee.object, state)
+      const index = this.processInstruction(scope, node.arguments[0], state)
+      const write = this.indexedWrite
+      if (write && write.call === node) {
+        write.receiver = receiver
+        write.index = index
+      }
+      const storage = this.getMemberValueNoCreate(receiver, { type: 'Identifier', name: node._meta.clangIndexedReference }, state)
+      return storage ? this.getMemberValue(storage, index, state) : new UndefinedValue()
+    }
     if (callee?.type === 'Identifier' && COMPILE_TIME_OPERATORS.has(callee.name)) {
       return new PrimitiveValue(scope.qid, `<${callee.name}>`, null, 'number', 'Literal', node.loc)
     }
@@ -732,14 +774,17 @@ class CAnalyzer extends Analyzer {
    * @returns 赋值结果
    */
   override processAssignmentExpression(scope: any, node: any, state: any): any {
+    // C++17 sequences a compound assignment's RHS before evaluating its target.
+    // This is also a permitted evaluation order for compiler-produced C expressions.
+    if (node?._meta?.clang?.kind === 'CompoundAssignOperator') {
+      node = { ...node, right: this.processInstruction(scope, node.right, state) }
+    }
     if (node?.left?._meta?.clangIndexedReference && supportsIndexedAssignment(node.operator)) {
       // Capture the receiver and index from the actual invocation. Never re-evaluate either at write-back.
       const previous = this.indexedWrite
       this.indexedWrite = { call: node.left }
       try {
-        // The shared compound evaluator reads the left operand first. C++17 sequences the RHS first.
-        const assignment = node.operator === '=' ? node : { ...node, right: this.processInstruction(scope, node.right, state) }
-        return super.processAssignmentExpression(scope, assignment, state)
+        return super.processAssignmentExpression(scope, node, state)
       } finally {
         this.indexedWrite = previous
       }
@@ -1062,6 +1107,11 @@ class CAnalyzer extends Analyzer {
    * @returns 语句结果
    */
   override processIfStatement(scope: any, node: any, state: any): any {
+    if (node._meta?.clangDeleteGuard) {
+      // The operand has already been saved. Literal null pointers cannot invoke a destructor.
+      const pointer = this.processInstruction(scope, node.test, state)
+      if (pointer?.type === 'Literal' && ((pointer.literalType === 'null' && pointer.value === null) || pointer.value === 0)) return new UndefinedValue()
+    }
     const constant = foldConstant(node?.test)
     if (constant !== undefined) {
       const taken = constant ? node.consequent : node.alternative

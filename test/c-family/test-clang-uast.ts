@@ -67,6 +67,31 @@ describe('experimental Clang AST to UAST', function () {
     assert.strictEqual(ast._meta.clangBackend.status, 'partial')
   })
 
+  it('keeps dependent template arguments separate from the member and namespace being looked up', () => {
+    const source = path.join(directory, 'dependent-names.cpp')
+    fs.writeFileSync(source, `namespace detail {struct Arg{};}
+      template<class A,class T> void visit(T); template<class T> int f(T* obj) {
+        visit<detail::Arg>(*obj); obj->template row<detail::Arg>(1); return T::template count<detail::Arg>;
+      }`)
+    const database = source + '.compile.json', report = source + '.json'
+    fs.writeFileSync(database, JSON.stringify([{ directory, file: source, arguments: ['clang++', '-std=c++17', '-c', source] }]))
+    const child = spawnSync(process.execPath, ['--import', 'tsx', 'src/main.ts', '--sourcePath', source,
+      '--language', 'cpp', '--dumpAST', '--cCompileCommands', database, '--cAstBackend', 'clang', '--report', report], { cwd: engine, encoding: 'utf8' })
+    assert.strictEqual(child.status, 0, child.stdout + child.stderr)
+    const ast = JSON.parse(fs.readFileSync(report, 'utf8'))
+    const ids = walk(ast, 'Identifier').filter(n => n._meta.clangLookup)
+    const count = ids.find(n => n.name === 'count'), visit = ids.find(n => n.name === 'visit')
+    assert.strictEqual(count._meta.qualifier, 'T')
+    assert.strictEqual(visit._meta.qualifier, undefined)
+    assert.strictEqual(visit._meta.clangLookup.usesADL, true)
+    assert.strictEqual(count._meta.clangLookup.argumentsText, '<detail::Arg>')
+    const member = walk(ast, 'MemberAccess').find(n => n.property.name === 'row')
+    assert.strictEqual(member._meta.pointer, true)
+    assert.strictEqual(member._meta.clangLookup.argumentsText, '<detail::Arg>')
+    assert.strictEqual(ast._meta.clangBackend.unsupported.dependent_name_resolution, 2)
+    assert.strictEqual(ast._meta.clangBackend.unsupported.dependent_member_resolution, 1)
+  })
+
   it('preserves calls inside dependent pack expansion patterns without claiming complete semantics', () => {
     const source = path.join(directory, 'pack-pattern.cpp')
     fs.writeFileSync(source, `int transform(int); template<class... T> int sink(T...);
@@ -207,11 +232,134 @@ describe('experimental Clang AST to UAST', function () {
     assert.strictEqual(child.status, 0, child.stdout + child.stderr)
     const ast = JSON.parse(fs.readFileSync(report, 'utf8'))
     assert.strictEqual(ast._meta.clangBackend.unsupported.cpp_allocation_semantics, 1)
-    assert.strictEqual(ast._meta.clangBackend.unsupported.cpp_delete_semantics, 1)
-    assert.deepStrictEqual(walk(ast, 'CallExpression').map(call => call.callee.name), ['target', 'release', 'target'])
+    assert.ok(!ast._meta.clangBackend.unsupported.cpp_delete_semantics)
+    const calls = walk(ast, 'CallExpression').map(call => call.callee.name)
+    assert.deepStrictEqual(calls.filter(name => name !== 'sizeof'), ['target', 'release', 'operator delete', 'target'])
     assert.strictEqual(walk(ast, 'NewExpression')[0].callee.name, 'Owner')
     assert.strictEqual(walk(ast, 'ThrowStatement').length, 1)
     assert.strictEqual(walk(walk(ast, 'ThrowStatement')[0], 'CallExpression')[0].callee.name, 'target')
+  })
+
+  it('retains guarded and opaque deletes and distinguishes allocation operands', () => {
+    const source = path.join(directory, 'delete-and-placement.cpp')
+    fs.writeFileSync(source, `
+      void *operator new(decltype(sizeof(0)), void*) noexcept;
+      int n(); void *address(); struct Leaf { int field; ~Leaf() noexcept {} };
+      struct Sealed final {virtual ~Sealed() noexcept {}}; struct Virtual { virtual ~Virtual(); }; struct Custom { static void operator delete(void*); };
+      Leaf *next(); void drops(Virtual *v, Custom *c, Leaf *a, int *i, Sealed *sealed) {
+        delete next(); delete v; delete c; delete[] a; delete[] i; delete (Leaf*)nullptr; delete sealed;
+      }
+      void allocate(){new(address()) int(n()); new int[n()]{n()}; new(address()) int; new int;}
+    `)
+    const database = source + '.compile.json', report = source + '.json'
+    fs.writeFileSync(database, JSON.stringify([{ directory, file: source, arguments: ['clang++', '-std=c++17', '-c', source] }]))
+    const child = spawnSync(process.execPath, ['--import', 'tsx', 'src/main.ts', '--sourcePath', source,
+      '--language', 'cpp', '--dumpAST', '--cCompileCommands', database, '--cAstBackend', 'clang', '--report', report], { cwd: engine, encoding: 'utf8' })
+    assert.strictEqual(child.status, 0, child.stdout + child.stderr)
+    const ast = JSON.parse(fs.readFileSync(report, 'utf8'))
+    const guarded = walk(ast, 'Sequence').filter(n => n._meta.clangDelete)
+    const opaque = walk(ast, 'UnaryExpression').filter(n => n._meta.clangDelete)
+    assert.strictEqual(guarded.length, 4)
+    assert.strictEqual(opaque.length, 3)
+    assert.strictEqual(ast._meta.clangBackend.unsupported.cpp_delete_semantics, 3)
+    assert.ok(opaque.every(n => n.argument && n._meta.clangDelete.lowering === 'opaque'))
+    for (const deletion of guarded) {
+      const [saved, guard] = deletion.expressions
+      assert.strictEqual(saved.type, 'VariableDeclaration')
+      assert.strictEqual(guard.test.name, saved.id.name)
+      assert.strictEqual(walk(guard.consequent, 'CallExpression').filter(call => call._meta.clangDeallocation).length, 1)
+    }
+    const destructor = walk(ast, 'FunctionDefinition').find(n => n.id.name === '~Leaf')
+    const members = walk(ast, 'MemberAccess').filter(n => n._meta.clangDestructorSymbol)
+    assert.strictEqual(members.length, 3)
+    assert.strictEqual(members.filter(n => n._meta.clangDestructorSymbol === destructor._meta.clang.mangledName).length, 2)
+    const sealed = walk(ast, 'FunctionDefinition').find(n => n.id.name === '~Sealed')
+    assert.strictEqual(sealed._meta.clangVirtual.dispatch, 'final')
+    assert.ok(members.some(n => n._meta.clangDestructorSymbol === sealed._meta.clang.mangledName))
+    assert.strictEqual(walk(ast, 'CallExpression').filter(call => call.callee.name === 'next').length, 1)
+    const allocations = walk(ast, 'NewExpression').filter(n => n._meta.clangAllocation)
+    assert.deepStrictEqual(allocations.map(n => n._meta.clangAllocation.operandRoles),
+      [['placement', 'initializer'], ['bound', 'initializer']])
+    assert.deepStrictEqual(allocations[0].arguments.map((arg: any) => arg.callee.name), ['address', 'n'])
+    assert.strictEqual(walk(allocations[1], 'CallExpression').filter(call => call.callee.name === 'n').length, 2)
+    const lowered = walk(ast, 'CastExpression').filter(n => n._meta.clangAllocation)
+    assert.deepStrictEqual(lowered.map(n => n._meta.clangAllocation.lowering), ['placement_address', 'allocator_call'])
+    assert.deepStrictEqual(walk(lowered[0], 'CallExpression').map(n => n.callee.name), ['address'])
+    assert.deepStrictEqual(walk(lowered[1], 'CallExpression').map(n => n.callee.name), ['operator new', 'sizeof'])
+    assert.strictEqual(ast._meta.clangBackend.unsupported.cpp_allocation_semantics, 2)
+  })
+
+  it('resolves exact virtual destructor chains and keeps an unknown dynamic type open', () => {
+    const source = path.join(directory, 'virtual-delete.cpp')
+    fs.writeFileSync(source, `#include <new>
+      namespace sample {
+      struct First; struct First;
+      struct Base {virtual ~Base() noexcept;};
+      struct First final:Base {~First() noexcept;};
+      struct Second final:Base {~Second() noexcept;};
+      struct LocalDelete final:Base {static void operator delete(void*);};
+      First* acquire(); void exact(){delete static_cast<Base*>(acquire());}
+      void other(Second* p){delete p;}
+      void fixed(){Base* const p=acquire(); delete p;}
+      void changed(Base* external){Base* p=acquire(); p=external; delete p;}
+      void nullable(){delete static_cast<First*>(nullptr);}
+      void unknown(Base* p){delete p;} void knownNull(){delete static_cast<Base*>(nullptr);}
+      void unsafe(LocalDelete* p){delete static_cast<Base*>(p);}
+      struct Holder {void drop(Base* p){delete p;}}; }
+      using sample::First; void imported(First* p){delete p;}
+      namespace other {struct First {virtual ~First();}; void shadow(First* p){delete p;}}`)
+    const database = source + '.compile.json', report = source + '.json'
+    fs.writeFileSync(database, JSON.stringify([{ directory, file: source, arguments: ['clang++', '-std=c++17', '-c', source] }]))
+    const run = spawnSync(process.execPath, ['--import', 'tsx', 'src/main.ts', '--sourcePath', source, '--language', 'cpp',
+      '--dumpAST', '--cCompileCommands', database, '--cAstBackend', 'clang', '--report', report], {cwd: engine, encoding:'utf8'})
+    assert.strictEqual(run.status, 0, run.stdout + run.stderr)
+    const ast = JSON.parse(fs.readFileSync(report, 'utf8'))
+    const funcs = walk(ast, 'FunctionDefinition')
+    const fn = (name: string) => funcs.find(f => f.id?.name === name)
+    for (const [name, leaf] of [['exact', 'First'], ['other', 'Second'], ['nullable', 'First'], ['fixed', 'First'], ['imported', 'First']]) {
+      const del = walk(fn(name), 'Sequence').find(n => n._meta.clangDelete)
+      assert.strictEqual(del._meta.clangDelete.completeObject, 'sample::' + leaf)
+      const guard = del.expressions[1]
+      assert.strictEqual(guard.type, 'IfStatement')
+      const effects = guard.consequent.body.map((s: any) => s.expression)
+      assert.deepStrictEqual(effects.map((c: any) => c.callee.property?.name || c.callee.name), ['~'+leaf,'~Base','operator delete'])
+      if (del._meta.clangDelete.signature.includes(',')) assert.strictEqual(effects[2].arguments[1]._meta.typeArguments[0]._meta.clangType.split('::').at(-1), leaf)
+    }
+    assert.strictEqual(walk(fn('exact'), 'CallExpression').filter(c => c.callee.name === 'acquire').length, 1)
+    assert.strictEqual(walk(fn('fixed'), 'CallExpression').filter(c => c.callee.name === 'acquire').length, 1)
+    for (const name of ['unknown','unsafe','drop','changed','shadow']) {
+      const del = walk(fn(name), 'UnaryExpression').find(n => n._meta.clangDelete)
+      assert.strictEqual(del._meta.clangDelete.target, 'dynamic_type_required')
+      assert.strictEqual(walk(fn(name), 'MemberAccess').filter(n => n._meta.clangDestructorSymbol).length, 0)
+    }
+    assert.strictEqual(walk(fn('knownNull'), 'UnaryExpression')[0]._meta.clangDelete.lowering, 'null_operand')
+    assert.strictEqual(ast._meta.clangBackend.unsupported.cpp_delete_semantics, 5)
+  })
+
+  it('models real standard vector references while preserving proxy and custom subscript calls', () => {
+    const source = path.join(directory, 'vector-references.cpp')
+    fs.writeFileSync(source, `#include <vector>
+      #include <string>
+      int index(); int input();
+      struct Custom { int &operator[](int i); };
+      void f(std::vector<int>& values, const std::vector<int>& view, std::vector<bool>& flags, Custom& other, std::string& text) {
+        values[index()] += input(); (void)view[0]; flags[0]=true; other[0]=2; text[1]='x'; (void)text[1];
+      }`)
+    const database = source + '.compile.json', report = source + '.json'
+    fs.writeFileSync(database, JSON.stringify([{ directory, file: source, arguments: ['clang++', '-std=c++17', '-c', source] }]))
+    const child = spawnSync(process.execPath, ['--import', 'tsx', 'src/main.ts', '--sourcePath', source,
+      '--language', 'cpp', '--dumpAST', '--cCompileCommands', database, '--cAstBackend', 'clang', '--report', report], { cwd: engine, encoding: 'utf8' })
+    assert.strictEqual(child.status, 0, child.stdout + child.stderr)
+    const ast = JSON.parse(fs.readFileSync(report, 'utf8'))
+    const calls = walk(ast, 'CallExpression')
+    const standard = calls.filter(n => n._meta.clangStdSubscript === 'vector')
+    assert.deepStrictEqual(standard.map(n => n.callee.object.name), ['values', 'view'])
+    const characters = calls.filter(n => n._meta.clangStdSubscript === 'basic_string')
+    assert.deepStrictEqual(characters.map(n => n.callee.object.name), ['text', 'text'])
+    assert.ok(standard.every(n => n.callee.property.name === 'operator[]' && n.callee.property._meta.clangDeclarationId))
+    assert.strictEqual(calls.filter(n => n.callee.name === 'index').length, 1)
+    assert.strictEqual(calls.filter(n => n.callee.name === 'input').length, 1)
+    assert.strictEqual(ast._meta.clangBackend.unsupported.assignment_location_semantics, 1)
   })
 
   it('preserves compound literals, variadic operand types and offsetof spelling', () => {
@@ -324,7 +472,13 @@ describe('experimental Clang AST to UAST', function () {
       int run(){int value=9; return ({int value=input(); value+=({int value=input();value;}); value;})+value;}
       void no_result(){({consume(input()); int local=1;});}
       struct Guard {Guard(); ~Guard(); int value;};
-      int cleanup(){return ({Guard guard; guard.value;});}`)
+      int cleanup(){return ({Guard guard; guard.value;});}
+      void remember(int&); void clean(int*);
+      int by_reference(){return ({int local=0; remember(local); local;});}
+      int temporary(){return ({Guard(); 1;});}
+      int with_attribute(){return ({int local __attribute__((cleanup(clean)))=1; local;});}
+      int *leaked; int external; int outer_address(){return ({int n=1; leaked=&external; n;});}
+      int escape(){return ({int local=0; leaked=&local; 1;});}`)
     const database = source + '.compile.json', report = source + '.json'
     fs.writeFileSync(database, JSON.stringify([{ directory, file: source, arguments: ['clang++', '-std=gnu++17', '-c', source] }]))
     const child = spawnSync(process.execPath, ['--import', 'tsx', 'src/main.ts', '--sourcePath', source,
@@ -345,7 +499,16 @@ describe('experimental Clang AST to UAST', function () {
     const cleanup = walk(ast, 'FunctionDefinition').find(fn => fn.id.name === 'cleanup')
     assert.ok(walk(cleanup, 'Sequence').some(node => node._meta.gnuStatementExpression))
     assert.ok(walk(cleanup, 'NewExpression').length > 0)
-    assert.strictEqual(ast._meta.clangBackend.unsupported.cpp_statement_expression_lifetime, 4)
+    assert.ok(scopes.every(node => node._meta.clangStatementExpression.lifetime === 'trivial'))
+    assert.strictEqual(block._meta.clangStatementExpression.yieldsValue, false)
+    assert.strictEqual(block._meta.clangStatementExpression.lifetime, 'trivial')
+    const outer = walk(ast, 'FunctionDefinition').find(fn => fn.id.name === 'outer_address')
+    assert.strictEqual(walk(outer, 'Sequence').find(node => node._meta.gnuStatementExpression)._meta.clangStatementExpression.lifetime, 'trivial')
+    for (const name of ['cleanup', 'by_reference', 'temporary', 'with_attribute', 'escape']) {
+      const fn = walk(ast, 'FunctionDefinition').find(fn => fn.id.name === name)
+      assert.strictEqual(walk(fn, 'Sequence').find(node => node._meta.gnuStatementExpression)._meta.clangStatementExpression.lifetime, 'unmodeled', name)
+    }
+    assert.strictEqual(ast._meta.clangBackend.unsupported.cpp_statement_expression_lifetime, 5)
     assert.ok(!ast._meta.clangBackend.unsupported.StmtExpr)
   })
 
@@ -532,9 +695,10 @@ describe('experimental Clang AST to UAST', function () {
     fs.writeFileSync(source, `struct Base {virtual int f(int) const=0;};
       struct Good:Base {int f(int) const override{return 1;}};
       struct Hidden:Base {int f(double) const{return 2;}};
-      struct Plain {int x;}; struct Zero:Plain {Zero():Plain(){}};
+      struct Plain {int x; bool b; int *p;}; struct Zero:Plain {Zero():Plain(){}};
       struct Defaulted {int x; Defaulted()=default;}; struct ZeroDefaulted:Defaulted {ZeroDefaulted():Defaulted(){}};
       struct Multi {Multi();Multi(int);}; struct Child:Multi {Child():Multi(1){}};
+      struct Generic {template<class T> Generic(T){} }; struct ViaTemplate:Generic {ViaTemplate():Generic(1){}};
       struct Deleg {Deleg():Deleg(0){} Deleg(int){} };`)
     const database = source + '.compile.json', report = source + '.json'
     fs.writeFileSync(database, JSON.stringify([{ directory, file: source, arguments: ['clang++', '-std=c++17', '-c', source] }]))
@@ -545,8 +709,25 @@ describe('experimental Clang AST to UAST', function () {
     const classes = walk(ast, 'ClassDefinition')
     assert.strictEqual(classes.find(n => n.id.name === 'Good').supers[0].name, 'Base')
     assert.deepStrictEqual(classes.find(n => n.id.name === 'Hidden').supers, [])
+    assert.strictEqual(classes.find(n => n.id.name === 'Hidden')._meta.clangInheritanceGap, 'hidden_member')
     assert.strictEqual(ast._meta.clangBackend.unsupported.cpp_baseclass_semantics, 1)
-    assert.strictEqual(ast._meta.clangBackend.unsupported.base_or_delegating_constructor, 4)
+    const childClass = classes.find(n => n.id.name === 'Child')
+    const call = walk(childClass, 'CallExpression').find(n => n.callee._meta?.clangBaseConstructor === 'Multi')
+    const prototype = walk(classes.find(n => n.id.name === 'Multi'), 'Noop')
+      .find(n => n._meta?.clang?.type === 'void (int)')
+    assert.ok(prototype?._meta.clang.mangledName)
+    assert.strictEqual(call.callee._meta.clangConstructorSymbol, prototype._meta.clang.mangledName)
+    assert.strictEqual(call.callee.object.type, 'SuperExpression')
+    assert.strictEqual(call.arguments[0].value, 1)
+    assert.strictEqual(walk(childClass, 'NewExpression').length, 0)
+    assert.ok(walk(classes.find(n => n.id.name === 'ViaTemplate'), 'NewExpression').length)
+    const zeroed = walk(classes.find(n => n.id.name === 'Zero'), 'AssignmentExpression')
+    assert.deepStrictEqual(zeroed.map(n => [n.left.property.name, n.right.value]), [['x', 0], ['b', false], ['p', null]])
+    assert.strictEqual(walk(classes.find(n => n.id.name === 'ZeroDefaulted'), 'AssignmentExpression')[0].right.value, 0)
+    const delegated = walk(classes.find(n => n.id.name === 'Deleg'), 'CallExpression')[0]
+    assert.strictEqual(delegated.callee.object.type, 'ThisExpression')
+    assert.ok(delegated.callee._meta.clangConstructorSymbol)
+    assert.strictEqual(ast._meta.clangBackend.unsupported.base_or_delegating_constructor, 1)
   })
 
   it('exports member-pointer operands and records unresolved member-pointer semantics', () => {
@@ -629,7 +810,7 @@ describe('experimental Clang AST to UAST', function () {
     const ast = JSON.parse(fs.readFileSync(report, 'utf8')), run = walk(ast, 'FunctionDefinition').find(fn => fn.id.name === 'run')
     const assignments = walk(run, 'AssignmentExpression')
     assert.deepStrictEqual(assignments.map(a => a.left._meta.clangIndexedReference), ['data', undefined, undefined, undefined, 'data', 'data'])
-    assert.strictEqual(ast._meta.clangBackend.unsupported.assignment_location_semantics, 4)
+    assert.strictEqual(ast._meta.clangBackend.unsupported.assignment_location_semantics, 3)
     const call = assignments[0].left
     assert.strictEqual(call.callee.object.name, 'b')
     assert.strictEqual(call.callee.property.name, 'operator[]')
