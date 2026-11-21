@@ -29,6 +29,10 @@ export class ClangUastConverter {
   private readonly body: any[] = []
   private readonly recordFields = new Map<string, string[]>()
   private readonly recordMembers = new Map<string, Set<string>>()
+  private readonly virtualMethods = new Map<string, Set<string>>()
+  private readonly directBases = new Map<string, string>()
+  private readonly singleConstructors = new Map<string, string>()
+  private readonly trivialDefaults = new Set<string>()
   private readonly enumValues = new Map<string, string>()
   private readonly labels = new Map<string, string>()
   private readonly records = new Map<string, { ast: any; scopes: string[] }>()
@@ -248,6 +252,24 @@ export class ClangUastConverter {
             UAST.memberAccess(UAST.thisExpression(), this.identifier(initializer.anyInit.name, initializer), false), value, '=', false,
           )), initializer.inner?.[0] || node)
         }
+        const owner = context.scopes.join('::')
+        const base = this.directBases.get(owner)
+        if (initializer.baseInit && base && input?.kind === 'CXXConstructExpr' &&
+            input.constructionKind === 'non-virtual base' && value.type === 'NewExpression') {
+          const signature = input.ctorType?.qualType
+          // Value initialization may zero fields even when the default ctor is trivial.
+          if (this.trivialDefaults.has(base) && !input.zeroing && !value.arguments.length && signature?.startsWith('void ()')) {
+            const noop = this.attach(UAST.noop(), input)
+            noop._meta.clangTrivialBaseConstructor = base
+            return noop
+          }
+          if (!input.zeroing && signature && this.singleConstructors.get(base) === signature) {
+            const member = UAST.memberAccess(UAST.superExpression(), UAST.identifier('_CTOR_'), false)
+            member._meta.clangBaseConstructor = base
+            const call = this.attach(UAST.callExpression(member, value.arguments), input)
+            return this.attach(UAST.expressionStatement(call), input)
+          }
+        }
         this.unsupported.set('base_or_delegating_constructor', (this.unsupported.get('base_or_delegating_constructor') || 0) + 1)
         return this.attach(UAST.expressionStatement(value), initializer.inner?.[0] || node)
       })
@@ -295,27 +317,41 @@ export class ClangUastConverter {
     const owner = { ast: result, scopes }
     if (node.id) this.records.set(node.id, owner)
     if (node.previousDecl) this.records.set(node.previousDecl, owner)
-    result.body.push(...this.declarations(node.inner || [], { ...context, scopes }))
+
     result._meta.kind = node.tagUsed || 'class'
     result._meta.qualifiedName = [...context.scopes, name].join('::')
+    const declaredMembers = (node.inner || []).filter(child => !child.isImplicit &&
+      ['FieldDecl', 'CXXMethodDecl'].includes(child.kind || '') && child.name)
     if (node.bases?.length) {
       result._meta.clangBases = node.bases.map((base: any) => ({ type: base.type?.qualType, access: base.access, isVirtual: base.isVirtual }))
       const base = node.bases[0]
       const baseType = (base.type?.desugaredQualType || base.type?.qualType || '').replace(/^(?:struct|class)\s+/, '')
       const candidates = [...context.scopes.map((_, i) => context.scopes.slice(0, context.scopes.length - i).join('::') + '::' + baseType), baseType]
       const known = candidates.find(name => this.recordMembers.has(name))
-      const members = (node.inner || []).filter(child => ['FieldDecl', 'CXXMethodDecl'].includes(child.kind || '')).map(child => child.name)
-      const hidesMember = known && members.some(name => name && this.recordMembers.get(known)!.has(name))
+      const hidesMember = known && declaredMembers.some(child => child.name && this.recordMembers.get(known)!.has(child.name) &&
+        !(child.kind === 'CXXMethodDecl' && this.virtualMethods.get(known)?.has(child.name + '|' + child.type?.qualType)))
       if (node.bases.length === 1 && !base.isVirtual && known && !hidesMember && !context.inFunction) {
+        this.directBases.set(scopes.join('::'), known)
         result.supers = [this.identifier(known, node)]
         result._meta.clangInheritance = 'single_nonvirtual'
       } else this.unsupported.set('cpp_baseclass_semantics', (this.unsupported.get('cpp_baseclass_semantics') || 0) + 1)
     }
-    const members = new Set<string>((node.inner || []).filter(child => ['FieldDecl', 'CXXMethodDecl'].includes(child.kind || '') && child.name).map(child => child.name!))
-    if (!node.bases?.length || result._meta.clangInheritance) {
+    if (!context.inFunction && (!node.bases?.length || result._meta.clangInheritance)) {
+      const members = new Set<string>(declaredMembers.map(child => child.name!))
       for (const base of result.supers) for (const member of this.recordMembers.get(base.name) || []) members.add(member)
-      this.recordMembers.set([...context.scopes, name].join('::'), members)
+      const virtuals = new Set<string>(this.virtualMethods.get(this.directBases.get(scopes.join('::')) || ''))
+      for (const child of node.inner || []) {
+        if (child.kind === 'CXXMethodDecl' && child.virtual) virtuals.add(child.name + '|' + child.type?.qualType)
+      }
+      this.virtualMethods.set(scopes.join('::'), virtuals)
+      const constructors = (node.inner || []).filter(child => child.kind === 'CXXConstructorDecl' && !child.isImplicit)
+      if (constructors.length === 1 && !constructors[0].explicitlyDefaulted && constructors[0].type?.qualType) {
+        this.singleConstructors.set(scopes.join('::'), constructors[0].type.qualType)
+      }
+      if (node.definitionData?.defaultCtor?.trivial) this.trivialDefaults.add(scopes.join('::'))
+      this.recordMembers.set(scopes.join('::'), members)
     }
+    result.body.push(...this.declarations(node.inner || [], { ...context, scopes }))
     return result
   }
 

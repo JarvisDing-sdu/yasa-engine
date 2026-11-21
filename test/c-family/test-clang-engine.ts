@@ -185,6 +185,44 @@ int main(void){${body}}`, false)
     assert.ok(sarif.runs[0].results.length > 0)
   })
 
+  it('runs the base constructor on the derived receiver', () => {
+    for (const [name, init, expected] of [['tainted', 'getenv("USER")', true], ['safe', '"ok"', false]] as const) {
+      const { sarif } = scan('base-init-' + name, `#include <stdlib.h>
+        struct B {const char *v; B(const char *p):v(p){}};
+        struct D:B {D(const char *p):B(p){}};
+        int main(){D d(${init});return system(d.v);}`, true)
+      assert.strictEqual(sarif.runs[0].results.length > 0, expected, name)
+    }
+  })
+
+  it('runs base initialization before the derived constructor body', () => {
+    for (const [name, body, expected] of [['inherit', '', true], ['replace', 'v="safe";', false]] as const) {
+      const { sarif } = scan('base-order-' + name, `#include <stdlib.h>
+        struct B {const char *v; B(){v=getenv("USER");}};
+        struct D:B {D(){${body}}};
+        int main(){D d;return system(d.v);}`, true)
+      assert.strictEqual(sarif.runs[0].results.length > 0, expected, name)
+    }
+  })
+
+  it('keeps constructor writes tied to the selected object and argument', () => {
+    const { sarif } = scan('base-receiver', `#include <stdlib.h>
+      struct B {const char *v; B(const char *p):v(p){}};
+      struct D:B {D(const char *unused,const char *p):B(p){}};
+      int main(){D safe(getenv("USER"),"safe"); D other("safe",getenv("USER"));return system(safe.v);}`, true)
+    assert.strictEqual(sarif.runs[0].results.length, 0)
+  })
+
+  it('uses the override when calling through a base pointer', () => {
+    const { sarif, graph } = scan('override', `#include <stdlib.h>
+      struct B {virtual char *read()=0;}; struct D:B {char *read() override {return getenv("USER");}};
+      int main(){D d;B *p=&d;return system(p->read());}`, true)
+    assert.ok(sarif.runs[0].results.length)
+    const pairs = Object.values<any>(graph.edges).map(edge =>
+      [graph.nodes[edge.sourceNodeId].funcDef?.name, graph.nodes[edge.targetNodeId].funcDef?.name])
+    assert.ok(pairs.some(([caller, target]) => caller === 'main' && target === 'read'))
+  })
+
   it('uses inherited instance fields through a nonvirtual single base', () => {
     const { sarif } = scan('single-base', `#include <stdlib.h>
       struct Base {char *value;char *get(){return value;}};

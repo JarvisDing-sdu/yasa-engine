@@ -527,6 +527,28 @@ describe('experimental Clang AST to UAST', function () {
     assert.ok(!ast._meta.clangBackend.unsupported.lambda_capture_semantics)
   })
 
+  it('distinguishes virtual overrides from name hiding and preserves unresolved constructor diagnostics', () => {
+    const source = path.join(directory, 'override-and-construct.cpp')
+    fs.writeFileSync(source, `struct Base {virtual int f(int) const=0;};
+      struct Good:Base {int f(int) const override{return 1;}};
+      struct Hidden:Base {int f(double) const{return 2;}};
+      struct Plain {int x;}; struct Zero:Plain {Zero():Plain(){}};
+      struct Defaulted {int x; Defaulted()=default;}; struct ZeroDefaulted:Defaulted {ZeroDefaulted():Defaulted(){}};
+      struct Multi {Multi();Multi(int);}; struct Child:Multi {Child():Multi(1){}};
+      struct Deleg {Deleg():Deleg(0){} Deleg(int){} };`)
+    const database = source + '.compile.json', report = source + '.json'
+    fs.writeFileSync(database, JSON.stringify([{ directory, file: source, arguments: ['clang++', '-std=c++17', '-c', source] }]))
+    const child = spawnSync(process.execPath, ['--import', 'tsx', 'src/main.ts', '--sourcePath', source,
+      '--language', 'cpp', '--dumpAST', '--cCompileCommands', database, '--cAstBackend', 'clang', '--report', report], { cwd: engine, encoding: 'utf8' })
+    assert.strictEqual(child.status, 0, child.stdout + child.stderr)
+    const ast = JSON.parse(fs.readFileSync(report, 'utf8'))
+    const classes = walk(ast, 'ClassDefinition')
+    assert.strictEqual(classes.find(n => n.id.name === 'Good').supers[0].name, 'Base')
+    assert.deepStrictEqual(classes.find(n => n.id.name === 'Hidden').supers, [])
+    assert.strictEqual(ast._meta.clangBackend.unsupported.cpp_baseclass_semantics, 1)
+    assert.strictEqual(ast._meta.clangBackend.unsupported.base_or_delegating_constructor, 4)
+  })
+
   it('exports member-pointer operands and records unresolved member-pointer semantics', () => {
     const source = path.join(directory, 'member-pointers.cpp')
     fs.writeFileSync(source, 'struct S { int value; int method(){return value;} }; int read(S *p, int S::*data, int(S::*method)()){return p->*data+(p->*method)();} int object(S s,int S::*data){return s.*data;}')
