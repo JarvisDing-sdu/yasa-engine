@@ -181,21 +181,6 @@ class CFamilyAnalyzer extends CAnalyzer {
   }
 
   /**
-   * Inspect branch syntax without walking CBranch runtime scope snapshots.
-   * @param node
-   * @param test
-   * @param state
-   * @param lstate
-   * @param rstate
-   * @returns {any} The existing branch merge result.
-   */
-  override postBranchProcessing(node: any, test: any, state: any, lstate: any, rstate?: any): any {
-    const consequent = node.consequent?.type === 'CBranch' ? node.consequent.body : node.consequent
-    const alternative = node.alternative?.type === 'CBranch' ? node.alternative.body : node.alternative
-    return super.postBranchProcessing({ ...node, consequent, alternative }, test, state, lstate, rstate)
-  }
-
-  /**
    * Analyze entrypoints sequentially, isolating their static storage snapshots.
    * @returns {Promise<boolean>} Whether interpretation completed.
    */

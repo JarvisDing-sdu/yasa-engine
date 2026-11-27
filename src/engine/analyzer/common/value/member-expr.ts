@@ -10,6 +10,20 @@ interface MemberExprOptions {
   loc?: any
 }
 
+const objectDescriptor = {
+  get(this: MemberExprValue) { return this._objectRef?.resolve(this.getSymbolTable()) ?? null },
+  set(this: MemberExprValue, val: Unit | null) { this._objectRef = val != null ? this._makeValueRefDirect(val) : null },
+  enumerable: true,
+  configurable: true,
+}
+
+const propertyDescriptor = {
+  get(this: MemberExprValue) { return this._propertyRef?.resolve(this.getSymbolTable()) ?? null },
+  set(this: MemberExprValue, val: Unit | null) { this._propertyRef = val != null ? this._makeValueRefDirect(val) : null },
+  enumerable: true,
+  configurable: true,
+}
+
 /**
  * MemberExprValue - 成员访问表达式（a.b, a[b]）
  *
@@ -38,18 +52,8 @@ export class MemberExprValue extends ExprValue {
     this.computed = computed
     Object.defineProperty(this, '_objectRef', { value: this._makeValueRefDirect(object), writable: true, enumerable: false, configurable: true })
     Object.defineProperty(this, '_propertyRef', { value: this._makeValueRefDirect(property), writable: true, enumerable: false, configurable: true })
-    Object.defineProperty(this, 'object', {
-      get(this: MemberExprValue) { return this._objectRef?.resolve(this.getSymbolTable()) ?? null },
-      set(this: MemberExprValue, val: Unit | null) { this._objectRef = val != null ? this._makeValueRefDirect(val) : null },
-      enumerable: true,
-      configurable: true,
-    })
-    Object.defineProperty(this, 'property', {
-      get(this: MemberExprValue) { return this._propertyRef?.resolve(this.getSymbolTable()) ?? null },
-      set(this: MemberExprValue, val: Unit | null) { this._propertyRef = val != null ? this._makeValueRefDirect(val) : null },
-      enumerable: true,
-      configurable: true,
-    })
+    Object.defineProperty(this, 'object', objectDescriptor)
+    Object.defineProperty(this, 'property', propertyDescriptor)
   }
 
   static fromOpts(upperQid: string, opts: MemberExprOptions): MemberExprValue {

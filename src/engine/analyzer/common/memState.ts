@@ -61,7 +61,7 @@ function cloneObject(object: any, state: any): any {
 function unionValuesMemState(scopes: any, states: any, brs: any): void {
   switch (unionAlgo) {
     case UnionAlgorithmOpt.BVT:
-      StateBVT.unionValues(scopes[0], states[0], brs)
+      StateBVT.unionValues(scopes[0], states[0], brs, states)
       break
     case UnionAlgorithmOpt.Basic:
     default:
@@ -179,7 +179,7 @@ function loadForkedValue(fvalue: any, state: any): any {
 function writeValueMemState(fields: any, id: any, value: any, state: any, scope: any): void {
   // BVT scheme
   if (state && unionAlgo === UnionAlgorithmOpt.BVT)
-    return StateBVT.writeValue(fields, id, value, state.brs, state.br_index, scope)
+    return StateBVT.writeValue(fields, id, value, state.brs, state.br_index, scope, state.cLocalCallbackBranch === true)
 
   // normal processing
   fields[id] = value

@@ -1,4 +1,5 @@
 import { primitiveToString } from '../../../util/variable-util'
+import { graphHasFunctionDefinition } from '../../../util/graph'
 import { AstRefList } from './value/ast-ref-list'
 import type { ISymbolTableManager } from './symbol-table-interface'
 import type { Invocation } from '../../../resolver/common/value/invocation'
@@ -542,6 +543,9 @@ class Analyzer extends BaseAnalyzer {
 
   private readonly estimatedInstructionCountCache: WeakMap<object, number> = new WeakMap()
 
+  private instructionFile?: { path: string; root: string; relative: string }
+  private instructionLocationKey?: (node: any, type: string) => string
+
   _lastProcessedNode: any // 内部存储，通过 getter/setter 访问
 
   thisIterationTime: number
@@ -974,17 +978,19 @@ class Analyzer extends BaseAnalyzer {
       return `${instructionType}:unknown_location`
     }
 
-    let sourceFile = node.loc.sourcefile || 'unknown_file'
-
-    // 如果存在项目路径前缀，则移除
-    if (this.options && this.options.maindir) {
-      const projectPath = this.options.maindir
-      if (sourceFile.startsWith(projectPath)) {
-        sourceFile = sourceFile.substring(projectPath.length)
-        // 移除可能存在的开头斜杠
-        if (sourceFile.startsWith('/')) {
-          sourceFile = sourceFile.substring(1)
+    const path = node.loc.sourcefile || 'unknown_file'
+    const root = this.options?.maindir
+    let sourceFile = path
+    if (root) {
+      const previous = this.instructionFile
+      if (previous && previous.path === path && previous.root === root) {
+        sourceFile = previous.relative
+      } else {
+        if (path.startsWith(root)) {
+          sourceFile = path.substring(root.length)
+          if (sourceFile.startsWith('/')) sourceFile = sourceFile.substring(1)
         }
+        this.instructionFile = { path, root, relative: sourceFile }
       }
     }
 
@@ -1433,23 +1439,8 @@ class Analyzer extends BaseAnalyzer {
    *
    * @param instructionType
    */
-  loadInstruction(instructionType: any) {
-    /**
-     *
-     * @param obj
-     */
-    function load(obj: any) {
-      if (!obj) return
-      // 使用 hasOwnProperty 方法检查 obj 是否拥有名为 instructionType 的属性。如果有，返回该属性的值
-      if (obj.hasOwnProperty(instructionType)) {
-        return obj[instructionType]
-      }
-      // 如果当前对象没有该属性，则调用 Object.getPrototypeOf 获取 obj 的原型对象
-      // 并在该原型对象上递归调用 load 函数。
-      return load(Object.getPrototypeOf(obj))
-    }
-
-    return load(this)
+  loadInstruction(instructionType: string) {
+    return (this as any)[instructionType]
   }
 
   // prePostFlag
@@ -1523,9 +1514,8 @@ class Analyzer extends BaseAnalyzer {
     }
 
     // 性能追踪：结束指令执行并更新统计（内部会检查是否启用）
-    this.performanceTracker.endInstructionAndUpdateStats(node, (node: any, instructionType: string) =>
-      this.getLocationKey(node, instructionType)
-    )
+    this.instructionLocationKey ??= (instruction, type) => this.getLocationKey(instruction, type)
+    this.performanceTracker.endInstructionAndUpdateStats(node, this.instructionLocationKey)
     if (!this.preprocessState && val?.__preprocess) {
       delete val.__preprocess
       this.processPre(val, state)
@@ -3189,17 +3179,16 @@ class Analyzer extends BaseAnalyzer {
     }
   }
 
-  /**
-   *
-   * @param scope
-   * @param cdef
-   * @param state
-   */
+  /** Runtime scope key for a class or a language-specific type declaration. */
+  protected classScopeName(name: string | undefined): string | undefined {
+    return name
+  }
+
   preProcessClassDefinition(scope: any, cdef: any, state: any) {
     if (!(cdef && cdef.body)) return new UndefinedValue() // Should not happen
 
     // pre-processing
-    const fname = cdef.id?.name
+    const fname = this.classScopeName(cdef.id?.name)
 
     const cscope = Scope.createSubScope(fname, scope, 'class') // class scope
     cscope.ast = cdef
@@ -3219,7 +3208,7 @@ class Analyzer extends BaseAnalyzer {
     if (!(cdef && cdef.body)) return new UndefinedValue() // Should not happen
 
     // pre-processing
-    const fname = cdef.id?.name
+    const fname = this.classScopeName(cdef.id?.name)
 
     const cscope = Scope.createSubScope(fname, scope, 'class') // class scope
     cscope.ast = cdef
@@ -3454,6 +3443,10 @@ class Analyzer extends BaseAnalyzer {
     return this.processReturnStatement(scope, returnLike, state)
   }
 
+  protected branchContainsTerminator(consequent: any, includeRevert: boolean): boolean {
+    return AstUtil.containsBranchTerminator(consequent, includeRevert)
+  }
+
   /**
    * after a branch is executed: merge branch information and so on
    * @param node
@@ -3463,44 +3456,34 @@ class Analyzer extends BaseAnalyzer {
    * @param rstate
    */
   postBranchProcessing(node: any, test: any, state: any, lstate: any, rstate?: any): any {
-    const terminate_at_left = AstUtil.satisfy(node.consequent, (x: any) => {
-      return x.type === 'ReturnStatement' || x.type === 'ThrowStatement'
-    })
-    if (!rstate) {
-      // adopt the condition of the left branch
-      if (terminate_at_left && test) {
-        // this branch has been terminated
-        const rtest = _.clone(test)
-        rtest.is_neg = true
-        state.pcond.push(rtest)
-      }
+    let leftTerminates: boolean | undefined
+    const terminates = (includeRevert: boolean): boolean => {
+      if (leftTerminates === true || (!includeRevert && leftTerminates === false)) return leftTerminates
+      // Both historical termination tests inspect the consequent.
+      const result = this.branchContainsTerminator(node.consequent, includeRevert)
+      if (!includeRevert) leftTerminates = result
+      return result
+    }
+    if (!rstate && test && terminates(false)) {
+      const rtest = _.clone(test)
+      rtest.is_neg = true
+      state.pcond.push(rtest)
     }
 
-    // union branch related information
     const { binfo } = state
-    if (binfo) {
-      const terminate_at_right = AstUtil.satisfy(node.consequent, (x: any) => {
-        return (
-          x.type === 'ReturnStatement' ||
-          x.type === 'ThrowStatement' ||
-          (x.type === 'FunctionCall' && x.expression.name === 'revert')
-        )
-      })
-      if (!terminate_at_left) {
-        for (const x in lstate.binfo) {
-          if (!binfo.hasOwnProperty(x)) {
-            binfo[x] = lstate.binfo[x]
-          }
-        }
-      }
-      if (rstate && !terminate_at_right) {
-        for (const x in rstate.binfo) {
-          if (!binfo.hasOwnProperty(x)) {
-            binfo[x] = rstate.binfo[x]
-          }
-        }
+    if (!binfo) return
+    const mergeInfo = (source: any, includeRevert: boolean) => {
+      let checked = false
+      for (const key in source) {
+        if (binfo.hasOwnProperty(key)) continue
+        // The termination query can affect the result only if a key will be copied.
+        if (!checked && terminates(includeRevert)) return
+        checked = true
+        binfo[key] = source[key]
       }
     }
+    mergeInfo(lstate.binfo, false)
+    if (rstate) mergeInfo(rstate.binfo, true)
   }
 
   private shouldApplyLibPropagationForCallableWithBody(node: CallExpression, fclos: SymbolValueType, callInfo: CallInfo | undefined, scope: ScopeType): boolean {
@@ -3630,34 +3613,24 @@ class Analyzer extends BaseAnalyzer {
     if (
       Config.makeAllCG &&
       state.callstack?.length > 0 &&
-      fclos?.ast.fdef?.type === 'FunctionDefinition' &&
       this.ainfo?.callgraph?.nodes
     ) {
-      for (const callgraphnode of this.ainfo?.callgraph?.nodes.values()) {
-        // 从 nodehash 还原 funcDef
-        let callgraphFuncDef = callgraphnode.opts?.funcDef
-        if (callgraphnode.opts?.funcDefNodehash && this.astManager) {
-          callgraphFuncDef = this.astManager.get(callgraphnode.opts.funcDefNodehash)
-        }
-        if (
-          callgraphFuncDef?.loc?.start?.line &&
-          callgraphFuncDef?.loc?.end?.line &&
-          callgraphFuncDef?.loc?.sourcefile === fclos.ast.fdef?.loc?.sourcefile &&
-          callgraphFuncDef?.loc?.start?.line === fclos.ast.fdef?.loc?.start?.line &&
-          callgraphFuncDef?.loc?.end?.line === fclos.ast.fdef?.loc?.end?.line
-        ) {
-          this.checkerManager.checkAtFunctionCallBefore(this, scope, node, state, {
-            callInfo,
-            fclos,
-            pcond: state.pcond,
-            entry_fclos: this.entry_fclos,
-            einfo: state.einfo,
-            state,
-            analyzer: this,
-            ainfo: this.ainfo,
-          })
-          return new CallExprValue(scope.qid, fclos, argvalues, node, node?.loc, fclos)
-        }
+      const definition = fclos?.ast.fdef
+      if (
+        definition?.type === 'FunctionDefinition' &&
+        graphHasFunctionDefinition(this.ainfo.callgraph.nodes, definition, this.astManager)
+      ) {
+        this.checkerManager.checkAtFunctionCallBefore(this, scope, node, state, {
+          callInfo,
+          fclos,
+          pcond: state.pcond,
+          entry_fclos: this.entry_fclos,
+          einfo: state.einfo,
+          state,
+          analyzer: this,
+          ainfo: this.ainfo,
+        })
+        return new CallExprValue(scope.qid, fclos, argvalues, node, node?.loc, fclos)
       }
     }
 

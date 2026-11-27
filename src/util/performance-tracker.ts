@@ -275,15 +275,14 @@ class PerformanceTracker {
 
   /**
    * 计算分位数
-   * @param values - 数值数组
+   * @param sorted - 已按升序排列的数值数组
    * @param percentile - 分位数（0-100）
    * @returns {number} 分位数值
    */
-  private calculatePercentile(values: number[], percentile: number): number {
-    if (values.length === 0) {
+  private percentileOfSorted(sorted: number[], percentile: number): number {
+    if (sorted.length === 0) {
       return 0
     }
-    const sorted = [...values].sort((a, b) => a - b)
     const index = Math.ceil((percentile / 100) * sorted.length) - 1
     return sorted[Math.max(0, Math.min(index, sorted.length - 1))]
   }
@@ -906,18 +905,18 @@ class PerformanceTracker {
       }
     }
     allExecutionTimes.sort((a, b) => a - b)
-    const executionTime70Percent = this.calculatePercentile(allExecutionTimes, 70)
-    const executionTime99Percent = this.calculatePercentile(allExecutionTimes, 99)
-    const executionTime100Percent = this.calculatePercentile(allExecutionTimes, 100)
+    const executionTime70Percent = this.percentileOfSorted(allExecutionTimes, 70)
+    const executionTime99Percent = this.percentileOfSorted(allExecutionTimes, 99)
+    const executionTime100Percent = this.percentileOfSorted(allExecutionTimes, 100)
 
     const allExecutionCounts: number[] = []
     for (const count of this.instructionStats.instructionCounts.values()) {
       allExecutionCounts.push(count)
     }
     allExecutionCounts.sort((a, b) => a - b)
-    const executionTimes70Percent = this.calculatePercentile(allExecutionCounts, 70)
-    const executionTimes99Percent = this.calculatePercentile(allExecutionCounts, 99)
-    const executionTimes100Percent = this.calculatePercentile(allExecutionCounts, 100)
+    const executionTimes70Percent = this.percentileOfSorted(allExecutionCounts, 70)
+    const executionTimes99Percent = this.percentileOfSorted(allExecutionCounts, 99)
+    const executionTimes100Percent = this.percentileOfSorted(allExecutionCounts, 100)
 
     return {
       avgExecutionTimePerInstruction,

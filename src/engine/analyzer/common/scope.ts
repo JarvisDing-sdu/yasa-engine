@@ -69,12 +69,12 @@ class Scope {
         if (fields) {
           const f = fields.hasOwnProperty
           if (f.vtype || f.type) return fields[node_name]
-          if (fields.hasOwnProperty(node_name)) return scope
+          if (f.call(fields, node_name)) return scope
         }
-        if (scope.ast && scope.ast.hasDecl(node_name))
-          return scope
-        if (scope.parent && scope.parent !== scope) {
-          return this.getDefScopeRec(scope.parent, node, limit - 1)
+        if (scope.ast?.hasDecl(node_name)) return scope
+        const parent = scope.parent
+        if (parent && parent !== scope) {
+          return this.getDefScopeRec(parent, node, limit - 1)
         }
         return undefined
       }
@@ -309,12 +309,11 @@ class Scope {
    */
   static joinQualifiedName(...args: any[]): string {
     let res = ''
-    if (!args) return res
     if (args.length === 1) return args[0]
     let separator = ''
-    for (const i in args) {
-      if (typeof args[i] !== 'string') continue
-      const arg = args[i]?.trim()
+    for (const part of args) {
+      if (typeof part !== 'string') continue
+      const arg = part.trim()
       if (arg) {
         res += separator + arg
         separator = '.'

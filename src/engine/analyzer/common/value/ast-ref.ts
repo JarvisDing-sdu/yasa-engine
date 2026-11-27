@@ -12,6 +12,7 @@ export interface AstNodeStore {
 }
 
 export interface AstNodeManager extends AstNodeStore {
+  getBindingNode?(ref: AstRef): BaseNode | null
   has(hash: string): boolean
   register(ast: BaseNode): string | null
 }

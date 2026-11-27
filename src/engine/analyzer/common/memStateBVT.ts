@@ -1,11 +1,44 @@
 const {
   ValueUtil: { BVTValue, UnionValue, Scoped, SymbolValue, UndefinedValue },
 } = require('../../util/value-util')
+const { noteFirstBranchWrite } = require('./value/join-observer')
+const { ValueRefMap } = require('./value/value-ref-map')
+const { canSkipGlobalJoin, afterGlobalJoin } = require('./global-branch-watch')
+const { EntityValue } = require('./value/entity-value')
 
 /** ************************************************************
  * Analysis state management with lazy side-effects;
  * including a lazy mechanism for scope unions
  * *********************************************************** */
+
+// Only the C full-graph interpreter opts into callable-only lexical variable joins.
+const localCallbackTrees = new WeakSet<object>()
+const callbackEntryValue = new WeakMap<object, any>()
+const continuingCallbackBranches = new WeakMap<object, boolean>()
+
+interface CallbackJoin {
+  prefix: string
+  arms: string[]
+  fallthrough: boolean
+}
+
+function isCallback(value: any): boolean {
+  if (value?.vtype === 'fclos') return true
+  if (value?.vtype !== 'union') return false
+  const members = value.value
+  return Array.isArray(members) && members.length > 0 && members.every((v: any) => v?.vtype === 'fclos')
+}
+
+function recordCallbackBranchEnd(state: object, continues: boolean): void {
+  continuingCallbackBranches.set(state, continues)
+}
+
+/** A goto snapshot must keep the value on that path before later branch joins mutate its BVT. */
+function snapshotCallback(value: any, state: any): any {
+  if (!state?.cLocalCallbackBranch || !state.brs || !localCallbackTrees.has(value)) return value
+  const onPath = readValue(value, state.brs, 0)
+  return isCallback(onPath) ? onPath : value
+}
 
 //* ************************* scope operations *****************
 
@@ -18,7 +51,8 @@ const {
  * @param br_index
  * @param scope
  */
-function writeValueBVT(fields: any, index: any, value: any, br: any, br_index: any, scope: any): void {
+function writeValueBVT(fields: any, index: any, value: any, br: any, br_index: any, scope: any, cCallbackBranch = false): void {
+  const trackCallback = cCallbackBranch && scope.vtype === 'scope' && !!scope.parent && !scope.isCModule && isCallback(value)
   /**
    *
    * @param tree
@@ -31,6 +65,7 @@ function writeValueBVT(fields: any, index: any, value: any, br: any, br_index: a
     if (!tree || tree.vtype !== 'BVT') {
       const oldTree = tree
       tree = new BVTValue('', `<BVT_create>`, {})
+      if (trackCallback) callbackEntryValue.set(tree, oldTree)
       tree.raw_value = oldTree
       // 保留原始值的类型信息
       if (oldTree?.rtype) tree.rtype = oldTree.rtype
@@ -57,11 +92,15 @@ function writeValueBVT(fields: any, index: any, value: any, br: any, br_index: a
       old_value = new BVTValue(scope.qid, `<BVT_${index}>`, {})
       old_value.raw_value = oldValue  // 直接设置 raw_value，不通过 setter
     } else if (old_value.vtype !== 'BVT') {
-      old_value = createBVT(scope.qid, br, old_value, value.ast?.node, index)
+      old_value = createBVT(scope.qid, br, old_value, value.ast?.node, index, trackCallback)
     }
+    if (trackCallback) localCallbackTrees.add(old_value)
     fields[index] = old_value
     // 标记此 scope 有 BVT 字段，供 mergeLeafValues parent 链跳跃使用
-    scope._hasBVTFields = true
+    if (!scope._hasBVTFields) {
+      scope._hasBVTFields = true
+      noteFirstBranchWrite(scope)
+    }
     write(old_value, br, br_index, old_value, index)
   } else if (scope.pointerReference) {
     // overwrite directly
@@ -78,14 +117,14 @@ function writeValueBVT(fields: any, index: any, value: any, br: any, br_index: a
  * @param old_value
  * @param node
  */
-function createBVT(qidPrefix: string, br: any, old_value: any, node: any, fieldIndex?: string): any {
+function createBVT(qidPrefix: string, br: any, old_value: any, node: any, fieldIndex?: string, trackCallback = false): any {
   if (!br || br.length === 0) {
     return old_value
   }
 
   const currentChar = br[0]
 
-  const nestedBVT = createBVT(qidPrefix, br.slice(1), old_value, node)
+  const nestedBVT = createBVT(qidPrefix, br.slice(1), old_value, node, undefined, trackCallback)
   let sig = '<NodeLocUnknown>'
   if (node?.loc?.sourcefile && typeof node?.loc?.sourcefile === 'string') {
     sig = `${node.loc?.sourcefile.substring((node.loc?.sourcefile.lastIndexOf('/') || 0) + 1, node.loc?.sourcefile.lastIndexOf('.'))}_${node.loc?.start?.line}_${node.loc?.start?.column}_${node.loc?.end?.line}_${node.loc?.end?.column}`
@@ -94,6 +133,7 @@ function createBVT(qidPrefix: string, br: any, old_value: any, node: any, fieldI
   const indexPart = fieldIndex ? `_${fieldIndex}` : ''
   const bvt = new BVTValue(qidPrefix, `<BVT_${sig}${indexPart}_${br}>`, { [currentChar]: nestedBVT })
   // 保留原始值的类型信息，供分支读取时传播
+  if (trackCallback) callbackEntryValue.set(bvt, old_value)
   if (old_value?.rtype) bvt.rtype = old_value.rtype
   return bvt
 }
@@ -256,6 +296,30 @@ function unionValue(v1: any, v2: any): any {
 }
 
 /**
+ * Merge the subtree of the current if. A sibling belongs to the enclosing join, and
+ * L_/R_ store overwritten values. For an untaken single arm the entry value survives.
+ * Mixed scalar/callback values continue to use the general value join.
+ */
+function mergeLocalCallback(root: any, join: CallbackJoin): any {
+  let branch = root
+  let owner: any
+  for (const arm of join.prefix) {
+    if (branch?.vtype !== 'BVT') return root
+    owner = branch
+    branch = branch.getChild(arm)
+  }
+  if (branch?.vtype !== 'BVT') return root
+  const incoming = callbackEntryValue.get(branch)
+  const values = join.arms.map(arm => branch.getChild(arm) ?? incoming)
+  if (join.fallthrough) values.push(incoming)
+  if (!values.length || !values.every(isCallback)) return undefined
+  const result = values.reduce(unionValue)
+  if (!owner) return result
+  owner.setChild(join.prefix.slice(-1), result)
+  return root
+}
+
+/**
  * value union for control-flow convergence points
  * @param scope
  * @param brs: a list of branch indices
@@ -265,12 +329,16 @@ function unionValue(v1: any, v2: any): any {
  * @param visited
  * @returns {*}
  */
-function mergeLeafValues(scope: any, brs: any, br_index: any, parent: any, visited: Set<any>): any {
+function mergeLeafValues(scope: any, brs: any, br_index: any, parent: any, visited: Set<any>, callbackJoin?: CallbackJoin): any {
   if (typeof scope !== 'object' || scope === null) return scope
   if (scope.type) return scope // expressions
 
   visited.add(scope)
   if (scope.vtype === 'BVT') {
+    if (callbackJoin && localCallbackTrees.has(scope)) {
+      const joined = mergeLocalCallback(scope, callbackJoin)
+      if (joined) return joined
+    }
     const c = brs[br_index]
     if (br_index < brs.length - 1) {
       const { children } = scope
@@ -291,18 +359,35 @@ function mergeLeafValues(scope: any, brs: any, br_index: any, parent: any, visit
     return vs // scope;
   }
   if (scope.vtype === 'object' || scope.vtype === 'fclos' || scope.vtype === 'scope') {
-    // 深度优先递归合并 scope 的所有字段
-    for (const field in scope.value) {
-      const v = scope.value[field]
-      if (visited.has(v)) continue
-      scope.value[field] = mergeLeafValues(v, brs, br_index, parent, visited)
+    const fields = scope.value
+    const members = fields && scope instanceof EntityValue ? scope.members : null
+    if (members instanceof ValueRefMap && members.getProxy() === fields && members.hasStandardPrototype()) {
+      const keys = members.mergeKeys()
+      const snapshot = members.prepareMergeSnapshot(keys)
+      for (let i = 0; i < keys.length; ++i) {
+        const field = keys[i]
+        if (!members.hasEnumerableMergeKey(field, snapshot, i)) continue
+        const currentFields = scope.value
+        const v = currentFields === fields ? members.readMergeField(field, snapshot, i) : currentFields[field]
+        if (visited.has(v)) continue
+        const target = scope.value
+        const joined = mergeLeafValues(v, brs, br_index, parent, visited, callbackJoin)
+        if (target === fields) members.set(field, joined, snapshot, i)
+        else target[field] = joined
+      }
+    } else {
+      for (const field in fields) {
+        const v = scope.value[field]
+        if (!visited.has(v)) scope.value[field] = mergeLeafValues(v, brs, br_index, parent, visited, callbackJoin)
+      }
     }
     // 沿 parent 链跳跃合并：只处理 writeValueBVT 标记过的 scope（_hasBVTFields），
     // 跳过无 BVT 修改的中间 parent，避免对大型 global scope 的无效遍历。
     let p = scope.parent
     while (p && !visited.has(p)) {
-      if (p._hasBVTFields) {
-        mergeLeafValues(p, brs, br_index, parent, visited)
+      if (p._hasBVTFields && !canSkipGlobalJoin(p, visited)) {
+        mergeLeafValues(p, brs, br_index, parent, visited, callbackJoin)
+        afterGlobalJoin(p)
         break // 更深层的 parent 会在 mergeLeafValues(p, ...) 的递归中处理
       }
       visited.add(p) // 标记已跳过，避免重复遍历
@@ -314,7 +399,7 @@ function mergeLeafValues(scope: any, brs: any, br_index: any, parent: any, visit
     for (const field in scope) {
       const v = scope[field]
       if (visited.has(v)) continue
-      scope[field] = mergeLeafValues(v, brs, br_index, parent, visited)
+      scope[field] = mergeLeafValues(v, brs, br_index, parent, visited, callbackJoin)
     }
     return scope
   }
@@ -456,8 +541,14 @@ function reduceBVTScope(scope: any, visited: Set<any>): any {
  * @param brs
  * @returns {*}
  */
-function unionValuesBVT(scope: any, lstate: any, brs: any): any {
-  return mergeLeafValues(scope, lstate.brs, brs.length, null, new Set())
+function unionValuesBVT(scope: any, lstate: any, brs: any, states?: any[]): any {
+  const hasOutcome = lstate.cLocalCallbackBranch && states?.some(s => continuingCallbackBranches.has(s))
+  const callbackJoin = hasOutcome && states ? {
+    prefix: lstate.brs.slice(0, -1),
+    arms: states.filter(s => continuingCallbackBranches.get(s) !== false).map(s => s.brs.slice(-1)),
+    fallthrough: states.length === 1,
+  } : undefined
+  return mergeLeafValues(scope, lstate.brs, brs.length, null, new Set(), callbackJoin)
 }
 
 /**
@@ -483,6 +574,8 @@ function unionAllValues(scopes: any, state: any): any {
 //* ***************************** exports ********************************************
 
 module.exports = {
+  recordCallbackBranchEnd,
+  snapshotCallback,
   readValue,
   writeValue: writeValueBVT,
   unionValues: unionValuesBVT,
