@@ -124,7 +124,7 @@ const defaultFilter = (nd: any, prop: string, from: any): boolean => {
  * 遍历 AST 节点树，为每个节点添加 parent 指针和 sourcefile 信息
  * @param sourceunit 根 AST 节点
  */
-function adjustASTNode(sourceunit: any): void {
+function adjustASTNode(sourceunit: any): any[] {
   const visited = new Set()
   visited.add(sourceunit)
   const worklist = [sourceunit]
@@ -192,6 +192,7 @@ function adjustASTNode(sourceunit: any): void {
       }
     }
   }
+  return worklist
 }
 
 interface AnnotateOptions {
@@ -205,14 +206,14 @@ interface AnnotateOptions {
  * @param node
  * @param options
  */
-function annotateAST(node: any, options?: AnnotateOptions): void {
+function annotateAST(node: any, options?: AnnotateOptions): any[] {
   sourcefile = null
   skipSourcefile = false
   if (options) {
     if (options.sourcefile !== undefined) sourcefile = options.sourcefile
     if (options.skipSourcefile) skipSourcefile = true
   }
-  adjustASTNode(node)
+  return adjustASTNode(node)
 }
 
 /**
@@ -221,7 +222,7 @@ function annotateAST(node: any, options?: AnnotateOptions): void {
  * @param obj 根 AST 节点
  * @param visited 已访问节点集合（内部使用，外部调用时无需传入）
  */
-function addNodeHash(obj: any, visited: WeakSet<any> = new WeakSet()): void {
+function addNodeHash(obj: any, visited: WeakSet<any> = new WeakSet(), astManager = getGlobalASTManager()): void {
   const pending: any[] = [obj]
   while (pending.length) {
     obj = pending.pop()
@@ -276,7 +277,6 @@ function addNodeHash(obj: any, visited: WeakSet<any> = new WeakSet()): void {
       // 如果设置了全局 AST 管理器，检查 nodehash 是否已存在
       // 如果已存在，则通过添加后缀来生成新的 nodehash，确保不替换原有对象
       // TODO 符号值重构todo：现在的并行方式globalASTManager获取不到
-      const astManager = getGlobalASTManager()
       if (astManager) {
         let suffix = 0
         while (astManager.has(nodehash)) {
@@ -367,6 +367,100 @@ function visit(node: any, visitor: any): void {
   }
 }
 
+const SATISFY_SKIPPED_PROPERTIES = new Set([
+  'parent',
+  '_parentRef',
+  'uuid',
+  'rrefs',
+  'trace',
+  'updates',
+  'type',
+  'operator',
+  'ast',
+  'loc',
+  '_owner',
+  'uninit',
+  'callnode',
+  'names',
+  '_this',
+  '_thisRef',
+  'cdef',
+  'fdef',
+  'packageScope',
+  '_packageScopeRef',
+  'fileScope',
+  'exports',
+  '__exportsUuid',
+  '__fileScopeUuid',
+  '_superRef',
+  '_scopeCtx',
+  'sid',
+  'qid',
+  '_declsNodehashMap',
+  '_ast',
+  'decls',
+  '_isConstructing',
+  'overloaded',
+  '_sid',
+  '_qid',
+  'vtype',
+  '_meta',
+])
+
+const SATISFY_WORKLIST_MAX = 5_000_000
+
+function resolveSatisfyField(value: any): any {
+  if (typeof value === 'string' && value.startsWith('symuuid_')) return getGlobalSymbolTable()?.get(value) || value
+  return value
+}
+
+/** Breadth-first termination query. Repeated edges and scalar properties still
+ * count toward the traversal cap without occupying a second queue slot.
+ */
+function containsBranchTerminator(root: any, includeRevert: boolean): boolean {
+  if (!root) return false
+  // A Set iterator visits newly inserted nodes in FIFO order and suppresses duplicate edges.
+  const queued = new Set<any>([root])
+  let edges = 1
+
+  function enqueue(value: any): void {
+    edges++
+    if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return
+    queued.add(value)
+  }
+
+  for (let node of queued) {
+    if (edges > SATISFY_WORKLIST_MAX) break
+    if (Array.isArray(node)) {
+      if (node.length > SATISFY_WORKLIST_MAX) continue
+      for (const item of node) {
+        if (edges > SATISFY_WORKLIST_MAX) break
+        enqueue(item)
+      }
+    }
+    if (
+      node.type === 'ReturnStatement' || node.type === 'ThrowStatement' ||
+      (includeRevert && node.type === 'FunctionCall' && node.expression.name === 'revert')
+    ) return true
+    if (node.vtype === 'BVT') node = node.children
+    if (node == null || typeof node !== 'object') continue
+    for (const prop in node) {
+      if (edges > SATISFY_WORKLIST_MAX) break
+      if (!Object.prototype.hasOwnProperty.call(node, prop)) continue
+      if (SATISFY_SKIPPED_PROPERTIES.has(prop) || prop.includes('__yasa')) continue
+      if (prop === '_field') {
+        const fields = node[prop]
+        for (const name in fields) {
+          if (Object.prototype.hasOwnProperty.call(fields, name)) enqueue(resolveSatisfyField(fields[name]))
+        }
+      } else {
+        enqueue(resolveSatisfyField(node[prop]))
+      }
+    }
+  }
+  return false
+}
+
 /**
  * get val in the node that satisfies the f condition.
  * @param node
@@ -389,35 +483,36 @@ function satisfy(
   const res: any[] = []
   visited = visited || new Set()
   const worklist = [node]
-  const fromlist = [node]
-  const depthlist = [1]
-  const parentMap = new WeakMap()
+  // Only filters and callbacks inspect predecessors. The plain existence query needs
+  // just its FIFO and visited set, even when a branch contains a large scope snapshot.
+  const fromlist = filter || satisfyCallback ? [node] : undefined
+  const depthlist = maxdepth ? [1] : undefined
+  const parentMap = satisfyCallback ? new WeakMap() : undefined
   // 使用索引替代 shift() 操作，提高性能
   let worklistIndex = 0
   // BFS worklist 上限防御：异常图深度遍历可达 2^32-1 触发 Array.push RangeError。
   // 上限 5M（约 80MB 引用空间）足够覆盖正常 sanitizer BFS，超限安全中断（return res）。
-  const WORKLIST_MAX = 5_000_000
   while (worklistIndex < worklist.length) {
-    if (worklist.length > WORKLIST_MAX) {
+    if (worklist.length > SATISFY_WORKLIST_MAX) {
       return res.length === 0 ? null : multiMatch ? res : null
     }
     node = worklist[worklistIndex]
-    const from = fromlist[worklistIndex]
-    const depth = depthlist[worklistIndex]
+    const from = fromlist?.[worklistIndex]
+    const depth = depthlist?.[worklistIndex]
     worklistIndex++
     if (!node || visited.has(node)) {
       continue
     }
     visited.add(node)
     if (Array.isArray(node)) {
-      // 超大数组（> WORKLIST_MAX）直接跳过 BFS 深入,避免 forEach 单轮 push 触达 2^32 抛 RangeError
-      if (node.length > WORKLIST_MAX) continue
+      // 超大数组（> SATISFY_WORKLIST_MAX）直接跳过 BFS 深入,避免 forEach 单轮 push 触达 2^32 抛 RangeError
+      if (node.length > SATISFY_WORKLIST_MAX) continue
       for (const child of node) {
-        if (worklist.length > WORKLIST_MAX) break
+        if (worklist.length > SATISFY_WORKLIST_MAX) break
         worklist.push(child)
-        fromlist.push(node)
-        depthlist.push(depth || 1)
-        if (child && typeof child === 'object') {
+        fromlist?.push(node)
+        depthlist?.push(depth || 1)
+        if (parentMap && child && typeof child === 'object') {
           parentMap.set(child, node)
         }
       }
@@ -441,50 +536,10 @@ function satisfy(
       if (depth > maxdepth) continue
     }
     for (const prop in node) {
-      if (worklist.length > WORKLIST_MAX) break
+      if (worklist.length > SATISFY_WORKLIST_MAX) break
       if (!Object.prototype.hasOwnProperty.call(node, prop)) continue
       // 过滤的时候 不仅要过滤_this还要过滤__this
-      if (
-        [
-          'parent',
-          '_parentRef',
-          'uuid',
-          'rrefs',
-          'trace',
-          'updates',
-          'type',
-          'operator',
-          'ast',
-          'loc',
-          '_owner',
-          'uninit',
-          'callnode',
-          'names',
-          '_this',
-          '_thisRef',
-          'cdef',
-          'fdef',
-          'packageScope',
-          '_packageScopeRef',
-          'fileScope',
-          'exports',
-          '__exportsUuid',
-          '__fileScopeUuid',
-          '_superRef',
-          '_scopeCtx',
-          'sid',
-          'qid',
-          '_declsNodehashMap',
-          '_ast',
-          'decls',
-          '_isConstructing',
-          'overloaded',
-          '_sid',
-          '_qid',
-          'vtype',
-          '_meta',
-        ].indexOf(prop) !== -1
-      ) {
+      if (SATISFY_SKIPPED_PROPERTIES.has(prop)) {
         continue
       }
       if (prop.includes('__yasa')) {
@@ -495,44 +550,20 @@ function satisfy(
         const sub_field = node[prop]
         for (const p in sub_field) {
           if (!Object.prototype.hasOwnProperty.call(sub_field, p)) continue
-          let fieldValue = sub_field[p]
-
-          // 如果属性值是以 symuuid_ 开头的字符串，从符号表中查找对应的符号值
-          if (typeof fieldValue === 'string' && fieldValue.startsWith('symuuid_')) {
-            const symbolTable = getGlobalSymbolTable()
-            if (symbolTable) {
-              // 优化：使用单次 get 替代 has + get，减少一次哈希查找
-              const resolved = symbolTable.get(fieldValue)
-              if (resolved) {
-                fieldValue = resolved
-              }
-            }
-          }
+          const fieldValue = resolveSatisfyField(sub_field[p])
           worklist.push(fieldValue)
-          fromlist.push(sub_field)
-          depthlist.push((depth || 0) + 1)
-          if (fieldValue && typeof fieldValue === 'object') {
+          fromlist?.push(sub_field)
+          depthlist?.push((depth || 0) + 1)
+          if (parentMap && fieldValue && typeof fieldValue === 'object') {
             parentMap.set(fieldValue, node)
           }
         }
       } else {
-        let v = node[prop]
-
-        // 如果属性值是以 symuuid_ 开头的字符串，从符号表中查找对应的符号值
-        if (typeof v === 'string' && v.startsWith('symuuid_')) {
-          const symbolTable = getGlobalSymbolTable()
-          if (symbolTable) {
-            // 优化：使用单次 get 替代 has + get，减少一次哈希查找
-            const resolved = symbolTable.get(v)
-            if (resolved) {
-              v = resolved
-            }
-          }
-        }
+        const v = resolveSatisfyField(node[prop])
         worklist.push(v)
-        fromlist.push(node)
-        depthlist.push((depth || 0) + 1)
-        if (v && typeof v === 'object') {
+        fromlist?.push(node)
+        depthlist?.push((depth || 0) + 1)
+        if (parentMap && v && typeof v === 'object') {
           parentMap.set(v, node)
         }
       }
@@ -1162,6 +1193,7 @@ module.exports = {
   getRawCode,
   visit,
   satisfy,
+  containsBranchTerminator,
   hasTag,
   findTag,
   ASTQuery,

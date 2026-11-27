@@ -1,3 +1,4 @@
+import { invalidateJoinIdentity } from './join-observer'
 import { AstRef } from './ast-ref'
 import type { AstNodeManager } from './ast-ref'
 import type { BaseNode } from '../../../../types/uast'
@@ -24,7 +25,9 @@ export class AstBinding {
     if (!ref) return null
     const mgr = this._owner.getASTManager()
     if (!mgr) return null
-    try { return mgr.get(ref.hash) ?? null } catch { return null }
+    try {
+      return mgr.getBindingNode ? mgr.getBindingNode(ref) : mgr.get(ref.hash) ?? null
+    } catch { return null }
   }
 
   private _toRef(astNode: BaseNode | null | undefined): AstRef | null {
@@ -44,7 +47,11 @@ export class AstBinding {
   }
 
   get node(): BaseNode | null { return this._resolve(this._nodeRef) }
-  set node(astNode: BaseNode | null | undefined) { this._nodeRef = this._toRef(astNode ?? null) }
+  set node(astNode: BaseNode | null | undefined) {
+    const ref = this._toRef(astNode ?? null)
+    if (this._nodeRef?.hash !== ref?.hash) invalidateJoinIdentity(this._owner)
+    this._nodeRef = ref
+  }
 
   get fdef(): BaseNode | null { return this._resolve(this._fdefRef) }
   set fdef(astNode: BaseNode | null | undefined) { this._fdefRef = this._toRef(astNode ?? null) }

@@ -270,7 +270,9 @@ class MemSpace extends Scope {
         if (isTainted) res.taint?.propagateFrom(res.object)
       }
     }
-    return res
+    // Public reads return an analyzer value even when the receiver has no
+    // concrete base. Internal lookups keep undefined so unions omit that path.
+    return res ?? (node?.type === 'MemberAccess' ? new UndefinedValue() : res)
   }
 
   /**
@@ -283,60 +285,71 @@ class MemSpace extends Scope {
    * @returns {*}
    */
   _getMemberValueRec(scope: any, node: any, state: any, createIfNotExists: boolean): any {
-    // if (DEBUG) logger.info('\nGet value: ' + formatNode(node) + ' in ' + Scope.formatScope(scope));
-    if (!node) return node // FIXME: check oldAST
+    const direct = (leaf: any) => this._getMemberValueDirect(
+      leaf.type === 'ThisExpression' || leaf.type === 'SuperExpression' ? this.thisFClos : scope,
+      leaf, state, createIfNotExists, 0,
+    )
+    if (!node || (node.vtype !== 'union' && node.type !== 'MemberAccess')) return node && direct(node)
 
-    if (node.vtype === 'union') {
-      // value union
-      const res = new UnionValue(undefined, undefined, `${scope.qid}.<union@memR:${node.qid}>`, node.ast?.node)
-      for (const el of node.value) {
-        const val = this._getMemberValueRec(scope, el, state, createIfNotExists)
-        if (val) res.appendValue(val)
-      }
-      return res
-    }
-
-    switch (node.type) {
-      case 'MemberAccess': {
-        const { object } = node
-        let subscope: any
-        if (!object) return node
-        if (object.type === 'Identifier' || object.type === 'MemberAccess') {
-          subscope = this._getMemberValueRec(scope, object, state, createIfNotExists)
-        } else if (object.type === 'Literal' || Array.isArray(object))
-          // the object part is already resolved
-          subscope = object
-        else {
-          subscope = this._getMemberValueRec(scope, object, state, createIfNotExists)
+    // Runtime member expressions borrow their receiver from the symbol table.
+    // Its canonical binding can point back into the same expression, even
+    // though the parsed C source was an ordinary finite subscript.
+    type Frame = { node: any; items?: Iterator<any>; union?: any }
+    const frames: Frame[] = []
+    const active = new Set<any>()
+    let current = node
+    let result: any
+    for (;;) {
+      if (!current || active.has(current)) {
+        result = undefined
+      } else if (current.vtype === 'union') {
+        const union = new UnionValue(undefined, undefined, `${scope.qid}.<union@memR:${current.qid}>`, current.ast?.node)
+        const items = current.value[Symbol.iterator]()
+        const first = items.next()
+        if (!first.done) {
+          frames.push({ node: current, items, union })
+          active.add(current)
+          current = first.value
+          continue
         }
-        if (!subscope) {
-          // subscope = this.getMemberValueRec(scope, object, state);
-          return
+        result = union
+      } else if (current.type === 'MemberAccess') {
+        const receiver = current.object
+        if (!receiver) {
+          result = current
+        } else {
+          frames.push({ node: current })
+          active.add(current)
+          // The lookup receiver can itself be a previously evaluated member.
+          // Rebasing that same object onto itself repeatedly grows its address.
+          if (receiver !== scope && receiver.type !== 'Literal' && !Array.isArray(receiver)) {
+            current = receiver
+            continue
+          }
+          result = receiver
         }
-
-        subscope.value = subscope.value || {}
-
-        const prop = node.property
-        // record the read references
-        // if (res && subscope.rrefs)
-        //     subscope.rrefs.push(res);
-        // else
-        //     subscope.rrefs = [res];
-        // if (res)
-        //     res.dsrc = { scope: subscope, property: prop };
-
-        return this._getMemberValueDirect(subscope, prop, state, createIfNotExists, 0, new Set())
+      } else {
+        result = direct(current)
       }
 
-      case 'Literal':
-      case 'Identifier':
-        return this._getMemberValueDirect(scope, node, state, createIfNotExists, 0, new Set())
-      case 'ThisExpression':
-        return this._getMemberValueDirect(this.thisFClos, node, state, createIfNotExists, 0, new Set())
-      case 'SuperExpression':
-        return this._getMemberValueDirect(this.thisFClos, node, state, createIfNotExists, 0, new Set())
-      default:
-        return this._getMemberValueDirect(scope, node, state, createIfNotExists, 0, new Set())
+      while (frames.length) {
+        const frame = frames[frames.length - 1]
+        if (frame.items) {
+          if (result) frame.union.appendValue(result)
+          const next = frame.items.next()
+          if (!next.done) {
+            current = next.value
+            break
+          }
+          result = frame.union
+        } else if (result) {
+          result.value = result.value || {}
+          result = this._getMemberValueDirect(result, frame.node.property, state, createIfNotExists, 0)
+        }
+        active.delete(frame.node)
+        frames.pop()
+      }
+      if (!frames.length) return result
     }
   }
 
@@ -435,9 +448,9 @@ class MemSpace extends Scope {
     }
 
     if (scope.vtype === 'union' && Array.isArray(scope.value)) {
-      // union 作为对象载体时，字段写入必须落到每个候选对象。
+      // Member lookup can return no location for an already-visited alias.
       for (const element of scope.value as UnitType[]) {
-        this.saveVarInScopeRec(element, node, value, state)
+        if (element != null) this.saveVarInScopeRec(element, node, value, state)
       }
       return
     }
@@ -447,7 +460,10 @@ class MemSpace extends Scope {
     switch (node.type) {
       case 'MemberAccess': {
         const prop = node.property
-        let subscope = this.getMemberValue(scope, node.object, state)
+        // A literal receiver is already evaluated and has no writable fields.
+        // Looking it up in scope would turn e.g. a null pointer into the key "null".
+        if (node.object?.type === 'Literal') return
+        let subscope = node.object === scope ? scope : this.getMemberValue(scope, node.object, state)
         if (!subscope) {
           // important: e.g. the object scope is an expression
           if (!node.object) {
@@ -615,17 +631,12 @@ class MemSpace extends Scope {
     state: any,
     createIfNotExists: boolean,
     stack: number,
-    visited: Set<UnitType>
+    visited?: Set<UnitType>
   ): any {
-    if (!scope) return // FIXME
-    visited = visited || new Set()
-    // if (stack > 20) {
-    //   return undefined
-    // }
-    if (!scope || visited.has(scope)) {
-      return undefined
-    }
-    visited.add(scope)
+    if (!scope || visited?.has(scope)) return undefined
+    // Only union and fork traversal shares this set with a recursive call.
+    if (visited) visited.add(scope)
+    else if (scope.vtype === 'union' || scope.vtype === 'BVT') visited = new Set([scope])
     if (scope.vtype === 'union') {
       const res: UnitType[] = []
       scope.value.forEach((s: UnitType) => {
@@ -653,7 +664,7 @@ class MemSpace extends Scope {
       const objectVal = this._getMemberValueRec(scope, node.object, state, createIfNotExists)
       if (objectVal && objectVal.type !== 'MemberAccess') {
         // objectVal 已解析为实际对象，递归取 property
-        return this._getMemberValueDirect(objectVal, node.property, state, createIfNotExists, stack + 1, new Set())
+        return this._getMemberValueDirect(objectVal, node.property, state, createIfNotExists, stack + 1)
       }
     }
 

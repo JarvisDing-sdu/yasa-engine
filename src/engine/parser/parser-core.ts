@@ -146,20 +146,35 @@ function hasValidNodeHash(ast: any, expectedSourcefile: string): boolean {
   return actualSourcefile === expectedSourcefile
 }
 
+function isLineColumn(position: any): boolean {
+  return typeof position?.line === 'number' && typeof position.column === 'number' && Object.keys(position).length === 2
+}
+
+function isPlainSourceLocation(loc: any): boolean {
+  return typeof loc.sourcefile === 'string' && Object.keys(loc).length === 3 && isLineColumn(loc.start) && isLineColumn(loc.end)
+}
+
+type WorkerAstMode = 'serialize' | 'restore'
+
 /**
  * 遍历 AST 树，将已有 nodehash 的节点注册到 astManager（不重新计算 hash）
  * 用于 Worker 子进程返回的 AST：hash 已在子进程计算，但未注册到主进程 astManager
  */
-function registerExistingHashes(obj: any, astManager: any, visited?: Set<any>): void {
+function registerExistingHashes(obj: any, astManager: any, visited: Set<any> | null = new Set()): void {
   if (!obj || typeof obj !== 'object') return
-  if (!visited) visited = new Set()
-  if (visited.has(obj)) return
-  visited.add(obj)
+  if (visited) {
+    if (visited.has(obj)) return
+    visited.add(obj)
+  }
 
   if (obj._meta?.nodehash) {
     astManager.register(obj)
   }
 
+  if (!visited && Array.isArray(obj)) {
+    for (const item of obj) registerExistingHashes(item, astManager, null)
+    return
+  }
   for (const key in obj) {
     if (key === 'parent') continue
     if (key === '_meta') {
@@ -174,6 +189,7 @@ function registerExistingHashes(obj: any, astManager: any, visited?: Set<any>): 
     if (!Object.prototype.hasOwnProperty.call(obj, key)) continue
     const subObj = obj[key]
     if (!subObj || typeof subObj !== 'object') continue
+    if (!visited && key === 'loc' && isPlainSourceLocation(subObj)) continue
     registerExistingHashes(subObj, astManager, visited)
   }
 }
@@ -198,16 +214,18 @@ function processAst(
   code: any,
   options: Record<string, any>,
   needsSourcefile?: boolean,
-  skipHashIfExists?: boolean
+  skipHashIfExists?: boolean,
+  workerMode?: WorkerAstMode
 ): any {
   const shouldSetSourcefile = needsSourcefile !== false
 
   const fname = code != null ? SourceLine.storeCode(options?.sourcefile, code) : options?.sourcefile || ''
 
+  let annotatedNodes: any[] | undefined
   if (shouldSetSourcefile) {
     try {
       // annotateAST 会调用 adjustASTNode，为所有节点添加 parent 指针
-      AstUtil.annotateAST(ast, options ? { sourcefile: fname } : null)
+      annotatedNodes = AstUtil.annotateAST(ast, options ? { sourcefile: fname } : null)
       if (!ast.loc) ast.loc = {}
       ast.loc.sourcefile = fname
     } catch (e) {
@@ -216,7 +234,7 @@ function processAst(
   } else {
     try {
       // 即使不设置 sourcefile，也会添加 parent 指针
-      AstUtil.annotateAST(ast, { skipSourcefile: true })
+      annotatedNodes = AstUtil.annotateAST(ast, { skipSourcefile: true })
     } catch (e) {
       handleException(e, `[processAst] annotateAST 失败: ${fname}`, `[processAst] annotateAST 失败: ${fname}`)
     }
@@ -228,15 +246,26 @@ function processAst(
       // Worker 子进程计算了 hash 但无法注册（子进程没有 astManager），主进程需要补注册
       const astManager = getGlobalASTManager()
       if (astManager) {
-        registerExistingHashes(ast, astManager)
+        // JSON IPC expands aliases. The only cycles added after receipt
+        // are parent pointers, which registerExistingHashes always skips.
+        registerExistingHashes(ast, astManager, workerMode === 'restore' ? null : undefined)
       }
     } else {
-      addNodeHash(ast)
+      // Workers compute base hashes without a shared registry. A retry in the
+      // main process must produce the same hashes even when locations collide.
+      addNodeHash(ast, undefined, workerMode === 'serialize' ? null : undefined)
     }
   } catch (e) {
     handleException(e, `[processAst] addNodeHash 失败: ${fname}`, `[processAst] addNodeHash 失败: ${fname}`)
   }
 
+  if (workerMode === 'serialize') {
+    if (annotatedNodes) {
+      for (const node of annotatedNodes) delete node.parent
+    } else {
+      AstUtil.deleteParent(ast)
+    }
+  }
   return ast
 }
 
@@ -254,7 +283,8 @@ function processParsedAst(
   code: string | null,
   options: Record<string, any>,
   config: LanguageParserConfig,
-  skipHashIfExists?: boolean
+  skipHashIfExists?: boolean,
+  workerMode?: WorkerAstMode
 ): any {
   if (!ast) {
     return null
@@ -263,16 +293,16 @@ function processParsedAst(
   if (config.unit === 'package') {
     if (Array.isArray(ast)) {
       const [packageInfo, moduleName] = ast
-      const processedPackageInfo = processAst(packageInfo, code, options, config.needsSourcefile, skipHashIfExists)
+      const processedPackageInfo = processAst(packageInfo, code, options, config.needsSourcefile, skipHashIfExists, workerMode)
       return { packageInfo: processedPackageInfo, moduleName }
     }
     if (ast && typeof ast === 'object' && 'packageInfo' in ast && 'moduleName' in ast) {
-      ast.packageInfo = processAst(ast.packageInfo, code, options, config.needsSourcefile, skipHashIfExists)
+      ast.packageInfo = processAst(ast.packageInfo, code, options, config.needsSourcefile, skipHashIfExists, workerMode)
       return ast
     }
-    return processAst(ast, code, options, config.needsSourcefile, skipHashIfExists)
+    return processAst(ast, code, options, config.needsSourcefile, skipHashIfExists, workerMode)
   }
-  return processAst(ast, code, options, config.needsSourcefile, skipHashIfExists)
+  return processAst(ast, code, options, config.needsSourcefile, skipHashIfExists, workerMode)
 }
 
 /**
@@ -291,7 +321,8 @@ function parseFile(
   code: string,
   language: string,
   options: Record<string, any>,
-  config: { unit: string; needsSourcefile?: boolean }
+  config: { unit: string; needsSourcefile?: boolean },
+  prepareForWorker = false
 ): { filepath: string; ast: any } {
   // 获取解析器（使用缓存）
   const parseSingleFile = getParser(language)
@@ -309,7 +340,7 @@ function parseFile(
   }
 
   // 后处理 AST
-  const processedAst = processParsedAst(parseResult, code, options, config as LanguageParserConfig)
+  const processedAst = processParsedAst(parseResult, code, options, config as LanguageParserConfig, false, prepareForWorker ? 'serialize' : undefined)
 
   return { filepath, ast: processedAst }
 }

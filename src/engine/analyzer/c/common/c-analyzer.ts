@@ -19,6 +19,7 @@ const StateUtil = require('../../../util/state-util')
 const { foldConstant } = require('./c-const-eval')
 const { CTypeIndex } = require('./c-types')
 const { CCallbackIndex } = require('./c-callbacks')
+const { recordCallbackBranchEnd, snapshotCallback } = require('../../common/memStateBVT')
 const Scope = require('../../common/scope')
 const { lodashCloneWithTag } = require('../../../../util/clone-util')
 
@@ -97,6 +98,46 @@ function isConditional(fclos: any): boolean {
 }
 
 
+/** Project a C translation unit onto its external declarations without changing the diagnostic AST. */
+function cFileScopeNode(node: any): any {
+  let children: Record<string, unknown>
+  switch (node?.type) {
+    case 'FunctionDefinition':
+    case 'ClassDefinition':
+    case 'VariableDeclaration':
+    case 'ImportExpression':
+      return node
+    case 'Noop':
+      return node._meta?.goto ? undefined : node
+    case 'CompileUnit':
+    case 'Sequence': {
+      const key = node.type === 'CompileUnit' ? 'body' : 'expressions'
+      const items = node[key]
+      if (!Array.isArray(items)) return node
+      const kept = items.map(cFileScopeNode).filter(Boolean)
+      if (items.length === kept.length && items.every((item, i) => item === kept[i])) return node
+      children = { [key]: kept }
+      break
+    }
+    case 'IfStatement': {
+      // Unresolved macro alternatives can each expand to a declaration.
+      if (!node.test?._meta?.preprocessorChoice) return undefined
+      const consequent = cFileScopeNode(node.consequent)
+      const alternative = cFileScopeNode(node.alternative)
+      if (!consequent && !alternative) return undefined
+      if (consequent === node.consequent && alternative === node.alternative) return node
+      children = { consequent: consequent || { type: 'Noop', loc: node.loc }, alternative: alternative || null }
+      break
+    }
+    default:
+      // Recovered statements have no execution context at file scope.
+      return undefined
+  }
+  // processInstruction registers every node by hash. Give the projection its own
+  // identity so lookups for the source unit still return the full recovered AST.
+  return { ...node, ...children, _meta: { ...node._meta, nodehash: undefined } }
+}
+
 /** 不可达代码中仍需处理的定义（函数、struct） */
 const HOISTED = new Set(['FunctionDefinition', 'ClassDefinition'])
 
@@ -110,6 +151,7 @@ type Abrupt = 'return' | 'break' | 'continue' | 'goto'
 interface ControlFlow {
   dead: boolean
   reasons: Set<Abrupt>
+  breakTarget?: { reached: boolean }
   pending: Set<string>
   /** 标签 → 各条 goto 跳转时的变量快照，在标签处与顺序到达的路径合并 */
   labelStates: Map<string, ScopeSnapshot[]>
@@ -117,6 +159,9 @@ interface ControlFlow {
 
 /** 从当前块到函数作用域各层 scope 的变量值 */
 type ScopeSnapshot = Array<{ scope: any; fields: Map<string, any> }>
+
+/** A variable binding, or a member of the receiver evaluated when its address was taken. */
+type CLocation = { scope: any; node: any; member?: boolean }
 
 /** 分支（if 的两臂、switch 的 case）执行结束时的控制流状态 */
 interface BranchResult {
@@ -177,7 +222,8 @@ class CAnalyzer extends Analyzer {
    * 地址值 → 它指向的存储位置（scope + Identifier/MemberAccess）。`*e = v` 与 `*e`
    * 通过 e 当前值查表，逐级定位多级指针指向的位置。
    */
-  private pointees = new WeakMap<object, { scope: any; node: any }>()
+  private pointees = new WeakMap<object, CLocation>()
+  private resolvingPointees = new Set<object>()
 
   /** `&x` 为标量/指针变量创建的地址值 */
   private addresses = new WeakSet<object>()
@@ -187,6 +233,11 @@ class CAnalyzer extends Analyzer {
 
   /** Language id reported to the entrypoint executor */
   protected readonly languageId: string = 'c'
+
+  /** C struct, union and enum tags share a namespace distinct from ordinary identifiers. */
+  protected override classScopeName(name: string | undefined): string | undefined {
+    return this.languageId === 'c' && name ? `tag ${name}` : super.classScopeName(name)
+  }
 
   /**
    * @param file - 文件名
@@ -320,12 +371,13 @@ class CAnalyzer extends Analyzer {
     let m = this.topScope.context.modules.members.get(filename)
     if (m && typeof m === 'object') return m
 
-    this.types.annotate(ast)
-    this.callbacks.collect(ast, filename)
+    const moduleUnit = this.languageId === 'c' && ast.type === 'CompileUnit' ? cFileScopeNode(ast) : ast
+    this.types.annotate(moduleUnit)
+    this.callbacks.collect(moduleUnit, filename)
     const modClos = this.initModuleScope(ast, filename)
     this.importHeaderStatics(ast, modClos)
     this.topScope.context.modules.members.set(filename, modClos.getFieldValue('module.exports'))
-    m = this.processModuleDirect(ast, filename, modClos)
+    m = this.processModuleDirect(moduleUnit, filename, modClos)
     this.moduleScopes.set(filename, modClos)
     if (m && typeof m === 'object') {
       m.ast = ast
@@ -355,9 +407,10 @@ class CAnalyzer extends Analyzer {
     ;(modClos as any)._this = modClos
     ;(modClos as any).isCModule = true
 
-    const mod = new ObjectValue(modClos.qid, { sid: 'module', parent: modClos })
+    // A source file and its same-stem header have different translation-unit identities.
+    const mod = new ObjectValue(modClos.qid, { sid: 'module', parent: modClos, ast: node })
     modClos.value.module = mod
-    const exp = new ObjectValue(modClos.qid, { sid: 'module.exports', parent: modClos })
+    const exp = new ObjectValue(modClos.qid, { sid: 'module.exports', parent: modClos, ast: node })
     mod.value.exports = exp
     modClos.value.exports = exp
     return modClos
@@ -587,11 +640,20 @@ class CAnalyzer extends Analyzer {
       const pointerNode = stripCasts(target.argument)
       const pointerValue = this.processInstruction(scope, pointerNode, state)
       const pointee = pointerValue && typeof pointerValue === 'object' ? this.pointees.get(pointerValue) : undefined
-      if (pointee) this.saveVarInScope(pointee.scope, pointee.node, value, state)
+      if (pointee) this.writePointee(pointee, value, state)
       else if (isLocation(pointerNode)) this.saveVarInScope(scope, pointerNode, value, state)
       return
     }
     this.saveVarInScope(scope, target, value, state)
+  }
+
+  private writePointee(location: CLocation, value: any, state: any): void {
+    if (location.member) {
+      if (state?.brs) state.br_index = 0
+      this.saveVarInScopeRec(location.scope, location.node, value, state)
+    } else {
+      this.saveVarInScope(location.scope, location.node, value, state)
+    }
   }
 
   /**
@@ -741,7 +803,7 @@ class CAnalyzer extends Analyzer {
       }
     }
     if (pointee) {
-      this.saveVarInScope(pointee.scope, pointee.node, value, state)
+      this.writePointee(pointee, value, state)
     } else if (!this.addresses.has(pointerValue) && isLocation(pointerNode)) {
       // 指向未知存储（参数、堆）：引擎中指针与被指内容是同一个值，写入指针变量本身
       this.saveVarInScope(scope, pointerNode, value, state)
@@ -760,15 +822,27 @@ class CAnalyzer extends Analyzer {
   override processReferenceExpression(scope: any, node: any, state: any): any {
     const target = stripCasts(node?.argument)
     const targetType = this.types.typeOf(target)
+    let location: CLocation = { scope, node: target }
+    if (this.languageId === 'c' && target?.type === 'MemberAccess') {
+      // &a[f()] evaluates a and f() once. Dereferencing that address later
+      // reads the current element of the captured array, even if a was rebound.
+      const receiver = this.processInstruction(scope, target.object, state)
+      const key = target.computed ? this.processInstruction(scope, target.property, state) : target.property
+      location = { scope: receiver, node: key, member: true }
+    }
     if (isLocation(target) && targetType && !this.types.isStruct(targetType) && !this.types.isArray(targetType)) {
       const address = new ObjectValue(scope.qid, { sid: `&${AstUtil.prettyPrintAST(target)}`, parent: scope })
-      this.pointees.set(address, { scope, node: target })
+      this.pointees.set(address, location)
       this.addresses.add(address)
       return address
     }
+    if (location.member) {
+      const member = this.processMemberAccess(scope, { ...target, object: location.scope, property: location.node }, state)
+      node = { ...node, argument: member }
+    }
     const value = super.processReferenceExpression(scope, node, state)
     if (value && typeof value === 'object' && isLocation(target)) {
-      this.pointees.set(value, { scope, node: target })
+      this.pointees.set(value, location)
     }
     return value
   }
@@ -840,6 +914,7 @@ class CAnalyzer extends Analyzer {
    * @returns UndefinedValue
    */
   override processBreakStatement(scope: any, node: any, state: any): any {
+    if (this.flow.breakTarget) this.flow.breakTarget.reached = true
     this.abrupt('break')
     return super.processBreakStatement(scope, node, state)
   }
@@ -866,7 +941,7 @@ class CAnalyzer extends Analyzer {
     const label = node?._meta?.goto
     if (label) {
       const states = this.flow.labelStates.get(label) ?? []
-      states.push(this.snapshotScopes(scope))
+      states.push(this.snapshotScopes(scope, state))
       this.flow.labelStates.set(label, states)
       this.abrupt('goto', label)
     }
@@ -878,12 +953,13 @@ class CAnalyzer extends Analyzer {
    * @param scope - 当前 scope
    * @returns 快照
    */
-  private snapshotScopes(scope: any): ScopeSnapshot {
+  private snapshotScopes(scope: any, state?: any): ScopeSnapshot {
     const snapshot: ScopeSnapshot = []
     for (let s = scope, depth = 0; s && !s.isCModule && s !== this.topScope && depth < 64; s = s.parent, depth++) {
-      const keys = new Set<string>([...Object.keys(s._field || {}), ...(s.members ? [...s.members.keys()] : [])])
+      const keys = new Set(Object.keys(s._field || {}))
+      if (s.members) for (const key of s.members.keys()) keys.add(key)
       const fields = new Map<string, any>()
-      for (const key of keys) fields.set(key, s.getMemberValue(key))
+      for (const key of keys) fields.set(key, snapshotCallback(s.getMemberValue(key), state))
       snapshot.push({ scope: s, fields })
     }
     return snapshot
@@ -915,7 +991,11 @@ class CAnalyzer extends Analyzer {
     for (const snapshot of snapshots) {
       for (const { scope, fields } of snapshot) {
         const merged = byScope.get(scope) ?? new Map<string, any[]>()
-        for (const [key, value] of fields) merged.set(key, [...(merged.get(key) ?? []), value])
+        for (const [key, value] of fields) {
+          const values = merged.get(key)
+          if (values) values.push(value)
+          else merged.set(key, [value])
+        }
         byScope.set(scope, merged)
       }
     }
@@ -964,12 +1044,25 @@ class CAnalyzer extends Analyzer {
     const { flow } = this
     flow.dead = false
     flow.reasons = new Set()
+    if (this.languageId === 'c' && config.makeAllCG) state.cLocalCallbackBranch = true
     const before = node.snapshot ? this.snapshotScopes(scope) : undefined
     this.processInstruction(scope, node.body, state)
     node.results.push({ dead: flow.dead, reasons: flow.reasons, before })
+    if (state.cLocalCallbackBranch) {
+      // A break/continue can reach the enclosing loop or switch exit; keep its callback values.
+      const leavesJoin = flow.dead && [...flow.reasons].every(reason => reason === 'return' || reason === 'goto')
+      recordCallbackBranchEnd(state, !leavesJoin)
+    }
     flow.dead = false
     flow.reasons = new Set()
     return new UndefinedValue()
+  }
+
+  /** CBranch.results contains interpreter state. Only source syntax determines termination. */
+  protected override branchContainsTerminator(consequent: any, includeRevert: boolean): boolean {
+    const body = consequent?.type === 'CBranch' ? consequent.body : consequent
+    const indexed = this.languageId === 'c' ? this.types?.branchExits.get(body) : undefined
+    return indexed ?? super.branchContainsTerminator(body, includeRevert)
   }
 
   /**
@@ -1016,7 +1109,9 @@ class CAnalyzer extends Analyzer {
     const alternative = this.branch(node.alternative, results)
     // `if (c) { ...; return; }`：只有不进入分支的路径会继续执行，分支内的写入不应流到 if 之后
     // （条件本身的副作用保留：快照在进入分支时、条件求值之后记录）
-    if (alternative === node.alternative && consequent?.type === 'CBranch') consequent.snapshot = true
+    if (alternative === node.alternative && consequent?.type === 'CBranch') {
+      consequent.snapshot = this.languageId !== 'c' || this.types.branchExits.get(node.consequent) !== false
+    }
     const ret = super.processIfStatement(scope, { ...node, consequent, alternative }, state)
     const result = results[0]
     if (results.length === 1 && result.dead && result.before && [...result.reasons].every((r) => r === 'return')) {
@@ -1034,6 +1129,25 @@ class CAnalyzer extends Analyzer {
    * @returns 语句结果
    */
   override processSwitchStatement(scope: any, node: any, state: any): any {
+    return this.withBreakTarget(() => this.processSwitchCases(scope, node, state))
+  }
+
+  /** Enter a block at its selected case label, bypassing its preceding initializers. */
+  processCSwitchEntry(scope: any, node: any, state: any): any {
+    const { flow } = this
+    const pending = flow.pending
+    flow.pending = new Set([node.label])
+    this.abrupt('goto')
+    try {
+      return this.processInstruction(scope, node.body, state)
+    } finally {
+      flow.pending.delete(node.label)
+      for (const target of flow.pending) pending.add(target)
+      flow.pending = pending
+    }
+  }
+
+  private processSwitchCases(scope: any, node: any, state: any): any {
     // Only select a branch for literal integer discriminants. General constant
     // folding can erase side effects or target-dependent casts.
     const literalInteger = (expression: any): number | undefined => {
@@ -1046,12 +1160,19 @@ class CAnalyzer extends Analyzer {
     }
     const selected = literalInteger(node.discriminant)
     const clauses = node.cases || []
+    const dispatchBody = (c: any) => {
+      const owner = clauses[c._meta?.cCaseOwner]
+      return owner ? { type: 'CSwitchEntry', body: owner.body, label: c.body._meta.goto, loc: c.loc } : c.body
+    }
     if (selected !== undefined && clauses.every((c: any) => !c.test || literalInteger(c.test) !== undefined) &&
         clauses.every((c: any) => !c._meta?.clangCaseRange || c._meta.clangCaseRange.expanded)) {
       let index = clauses.findIndex((c: any) => c.test && literalInteger(c.test) === selected)
       if (index < 0) index = clauses.findIndex((c: any) => !c.test)
       if (index < 0) return new UndefinedValue()
-      const result = this.processInstruction(scope, clauses.slice(index).map((c: any) => c.body), state)
+      // Nested labels are alternate entries into code already in the owning
+      // clause. Only the directly selected entry may dispatch into that body.
+      const following = clauses.slice(index + 1).filter((c: any) => c._meta?.cCaseOwner === undefined)
+      const result = this.processInstruction(scope, [dispatchBody(clauses[index]), ...following.map((c: any) => c.body)], state)
       if (this.flow.dead && this.flow.reasons.size === 1 && this.flow.reasons.has('break')) {
         this.flow.dead = false
         this.flow.reasons.clear()
@@ -1059,7 +1180,7 @@ class CAnalyzer extends Analyzer {
       return result
     }
     const results: BranchResult[] = []
-    const cases = (node.cases || []).map((c: any) => ({ ...c, body: this.branch(c.body, results) }))
+    const cases = clauses.map((c: any) => ({ ...c, body: this.branch(dispatchBody(c), results) }))
     const ret = super.processSwitchStatement(scope, { ...node, cases }, state)
     const hasDefault = cases.some((c: any) => !c.test || c.test.type === 'Noop')
     this.joinBranches(results, hasDefault, 'break')
@@ -1096,6 +1217,25 @@ class CAnalyzer extends Analyzer {
     }
     const result = super.processBinaryExpression(scope, node, state)
     return this.propagateNumeric(result, [result?.left, result?.right])
+  }
+
+  /** A break on one branch still reaches the loop/switch exit when the other branch returns. */
+  private withBreakTarget<T>(run: () => T): T {
+    if (this.languageId !== 'c') return run()
+    const flow = this.flow
+    const outer = flow.breakTarget
+    const target = { reached: false }
+    flow.breakTarget = target
+    try {
+      const result = run()
+      if (target.reached) {
+        flow.dead = false
+        flow.reasons = new Set()
+      }
+      return result
+    } finally {
+      flow.breakTarget = outer
+    }
   }
 
   /**
@@ -1154,7 +1294,7 @@ class CAnalyzer extends Analyzer {
    */
   override processWhileStatement(scope: any, node: any, state: any): any {
     StateUtil.pushLoopInfo(state, node)
-    this.runLoop(scope, node, state, !!node?.isPostTest)
+    this.withBreakTarget(() => this.runLoop(scope, node, state, !!node?.isPostTest))
     StateUtil.popLoopInfo(state)
     return new UndefinedValue()
   }
@@ -1168,7 +1308,7 @@ class CAnalyzer extends Analyzer {
   override processForStatement(scope: any, node: any, state: any): any {
     StateUtil.pushLoopInfo(state, node)
     if (node.init) this.processInstruction(scope, node.init, state)
-    this.runLoop(scope, node, state, false)
+    this.withBreakTarget(() => this.runLoop(scope, node, state, false))
     StateUtil.popLoopInfo(state)
     return new UndefinedValue()
   }
@@ -1183,9 +1323,17 @@ class CAnalyzer extends Analyzer {
   override processDereferenceExpression(scope: any, node: any, state: any): any {
     const value = super.processDereferenceExpression(scope, node, state)
     const pointee = value && typeof value === 'object' ? this.pointees.get(value) : undefined
-    if (!pointee) return value
-    const current = this.processInstruction(pointee.scope, pointee.node, state)
-    return current ?? value
+    // A stored location such as (*anchor)->next can refer back to itself after
+    // anchor is reassigned. Keep the known value at that edge of the cycle.
+    if (!pointee || this.resolvingPointees.has(pointee)) return value
+    this.resolvingPointees.add(pointee)
+    try {
+      return (pointee.member
+        ? this.getMemberValue(pointee.scope, pointee.node, state)
+        : this.processInstruction(pointee.scope, pointee.node, state)) ?? value
+    } finally {
+      this.resolvingPointees.delete(pointee)
+    }
   }
 
   /**

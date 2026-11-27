@@ -36,18 +36,7 @@ interface WorkerResponse {
 
 const { parseFile: parseFileCore } = require('./parser-core')
 const config = require('../../config')
-
-/**
- * 原地删除 AST 所有节点的 parent 属性，避免 IPC JSON 序列化循环引用
- */
-function deleteParent(node: any, visited = new Set()): void {
-  if (!node || typeof node !== 'object' || visited.has(node)) return
-  visited.add(node)
-  delete node.parent
-  for (const key of Object.keys(node)) {
-    deleteParent(node[key], visited)
-  }
-}
+const { deleteParent } = require('../../util/ast-util')
 
 /**
  * 处理解析任务（完整 parse + processAst，发送前删掉 parent 避免循环引用）
@@ -94,8 +83,11 @@ async function processParseTask(task: ParseTask): Promise<{ filepath: string; as
       }
       await (task.language === 'cpp' ? ensureCppParserReady() : ensureCParserReady())
     }
-    const result = parseFileCore(task.filepath, task.content, task.language, task.options, task.config)
-    deleteParent(result.ast)
+    // The C frontends produce a parent-free UAST. Only the nodes visited by
+    // annotateAST acquire cycles, so metadata and source positions need no walk.
+    const detachAnnotatedParents = task.language === 'c' || task.language === 'cpp'
+    const result = parseFileCore(task.filepath, task.content, task.language, task.options, task.config, detachAnnotatedParents)
+    if (!detachAnnotatedParents) deleteParent(result.ast)
     return result
   } catch (error) {
     return {

@@ -948,9 +948,9 @@ class CheckerManager {
    * @param info
    */
   checkAtEndOfNode(analyzer: any, scope: any, node: any, state: any, info: any) {
-    const start_time: number = new Date().getTime()
-
     const { check_at_end_of_node } = this.checkpoints
+    if (check_at_end_of_node.length === 0) return
+    const start_time = Date.now()
     for (const i in check_at_end_of_node) {
       if (this.isCheckOn(check_at_end_of_node[i].getCheckerId())) {
         try {
@@ -966,8 +966,7 @@ class CheckerManager {
       }
     }
 
-    const end_time = new Date().getTime()
-    statistics.checkFiringTime += end_time - start_time
+    statistics.checkFiringTime += Date.now() - start_time
   }
 
   /**

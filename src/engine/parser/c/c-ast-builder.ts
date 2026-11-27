@@ -22,23 +22,29 @@ async function ensureInitialized(): Promise<void> {
   }
 }
 
-const headerCache = new Map<string, string | null>()
+type Header = { file: string; content: string }
 
-/**
- * @param file - 头文件路径
- * @returns 文件内容；不存在时为 null
- */
-function readHeader(file: string): string | null {
-  if (!headerCache.has(file)) {
-    let content: string | null = null
-    try {
-      if (fs.statSync(file).isFile()) content = fs.readFileSync(file, 'utf8')
-    } catch {
-      content = null
-    }
-    headerCache.set(file, content)
+const headerCache = new Map<string, Map<string, Header | null>>()
+
+/** Resolve each directory/name pair once, including unsuccessful lookups. */
+function readHeader(dir: string, name: string): Header | null {
+  const directory = path.isAbsolute(dir) ? dir : path.resolve(dir)
+  let entries = headerCache.get(directory)
+  if (!entries) {
+    entries = new Map()
+    headerCache.set(directory, entries)
   }
-  return headerCache.get(file) ?? null
+  const cached = entries.get(name)
+  if (cached !== undefined) return cached
+  const file = path.resolve(directory, name)
+  let header: Header | null = null
+  try {
+    if (fs.statSync(file).isFile()) header = { file, content: fs.readFileSync(file, 'utf8') }
+  } catch {
+    // A later search directory can still contain the header.
+  }
+  entries.set(name, header)
+  return header
 }
 
 /**
@@ -48,22 +54,23 @@ function readHeader(file: string): string | null {
  */
 function preprocessorOptions(): Record<string, unknown> {
   const pp = Config.cPreprocessor || {}
-  const includeDirs: string[] = [...(pp.includeDirs || []), ...(Config.maindir ? [Config.maindir] : [])]
+  const includeDirs: string[] = pp.includeDirs || []
+  const projectRoot = Config.maindir
   return {
     defines: pp.defines,
     undefines: pp.undefines,
     target: pp.target,
     unknownMacros: pp.unknownMacros,
     resolveInclude: (includePath: string, fromFile: string | undefined, angled: boolean) => {
-      const dirs = angled
-        ? [...(pp.includeDirs || [])]
-        : [...(fromFile ? [path.dirname(fromFile)] : []), ...includeDirs]
-      for (const dir of dirs) {
-        const file = path.resolve(dir, includePath)
-        const content = readHeader(file)
-        if (content !== null) return { file, content }
+      if (!angled && fromFile) {
+        const local = readHeader(path.dirname(fromFile), includePath)
+        if (local) return local
       }
-      return null
+      for (const dir of includeDirs) {
+        const header = readHeader(dir, includePath)
+        if (header) return header
+      }
+      return !angled && projectRoot ? readHeader(projectRoot, includePath) : null
     },
   }
 }

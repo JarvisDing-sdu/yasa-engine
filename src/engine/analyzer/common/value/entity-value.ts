@@ -1,3 +1,4 @@
+import { invalidateJoinIdentity } from './join-observer'
 import { ValueBase, SpringCtx, RuntimeState } from './value-base'
 import { ValueRefMap } from './value-ref-map'
 import { RAW_TARGET } from './symbols'
@@ -88,6 +89,7 @@ export abstract class EntityValue extends ValueBase {
     if (val === members.getProxy()) return
     const newOwner = val && typeof val === 'object' && val._owner
     if (newOwner && newOwner instanceof ValueRefMap) {
+      invalidateJoinIdentity(this)
       this._members = newOwner
       this._field = newOwner.getProxy()
       return
@@ -102,6 +104,7 @@ export abstract class EntityValue extends ValueBase {
         }
       }
     } else {
+      invalidateJoinIdentity(this)
       this.raw_value = val
     }
   }

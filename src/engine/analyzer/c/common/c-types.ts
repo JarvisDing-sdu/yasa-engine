@@ -16,6 +16,9 @@ const SKIP_KEYS = new Set(['loc', '_meta', 'parent', 'varType', 'returnType', 'a
  */
 /** 编译单元中 struct/union、typedef 与变量的声明类型 */
 export class CTypeIndex {
+  /** Does the source consequent contain a return or throw? Indexed before runtime annotations. */
+  readonly branchExits = new WeakMap<object, boolean>()
+
   /** struct/union 名 → 字段类型（同名定义取第一个） */
   private structs = new Map<string, FieldTypes>()
 
@@ -27,6 +30,7 @@ export class CTypeIndex {
    * @param unit - CompileUnit
    */
   annotate(unit: any): void {
+    let exits = 0
     const scopes: Array<Map<string, any>> = [new Map()]
     const define = (name: string | undefined, type: any) => {
       if (name && type) scopes[scopes.length - 1].set(name, type)
@@ -44,7 +48,16 @@ export class CTypeIndex {
         node.forEach(walk)
         return
       }
+      if (node.type === 'ReturnStatement' || node.type === 'ThrowStatement') exits++
       switch (node.type) {
+        case 'IfStatement': {
+          walk(node.test)
+          const before = exits
+          walk(node.consequent)
+          if (node.consequent) this.branchExits.set(node.consequent, exits > before)
+          walk(node.alternative)
+          return
+        }
         case 'ClassDefinition':
           this.registerStruct(node)
           return
