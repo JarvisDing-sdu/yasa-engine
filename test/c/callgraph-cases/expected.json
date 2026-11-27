@@ -194,5 +194,8 @@
   "dispatch.c:early": { "must": ["green", "amber"], "mustNot": ["red", "blue"] },
   "dispatch.c:goto_past": { "must": ["green", "amber"], "mustNot": ["red", "blue"] },
   "dispatch.c:goto_call": { "must": ["blue", "green", "amber"], "mustNot": ["red"] }
+ },
+ "J_compound_or": {
+  "compound.c:set_bits": { "must": ["slot", "mask"], "mustNot": [] }
  }
 }

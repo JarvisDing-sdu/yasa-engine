@@ -2250,6 +2250,7 @@ class Analyzer extends BaseAnalyzer {
         return tmpVal
       }
       case '&=':
+      case '|=':
       case '^=':
       case '<<=':
       case '>>=':
