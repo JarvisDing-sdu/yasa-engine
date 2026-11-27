@@ -3,10 +3,11 @@
 const fs = require('fs-extra')
 const path = require('path')
 const globby = require('fast-glob')
-const { fork } = require('child_process')
+const childProcess = require('child_process')
 const os = require('os')
 const FileUtil = require('../../util/file-util')
 const { md5 } = require('../../util/hash-util')
+const { stringifyJsonWithFallback } = require('../../util/deep-json')
 const Config = require('../../config')
 const logger = require('../../util/logger')(__filename)
 const { performanceTracker } = require('../../util/performance-tracker')
@@ -129,7 +130,7 @@ function loadWorker(workerName: string): any {
     if (fs.existsSync(workerPath)) {
       const execArgv = ['--max-old-space-size=2048']
       if (hasAntlr4tsFix) execArgv.push('--require', antlr4tsFixPath)
-      return fork(path.resolve(workerPath), [], isPkg
+      return childProcess.fork(path.resolve(workerPath), [], isPkg
         ? { execArgv: [], env: { ...process.env, NODE_OPTIONS: `--max-old-space-size=2048${hasAntlr4tsFix ? ` --require ${antlr4tsFixPath}` : ''}` } }
         : { execArgv })
     }
@@ -151,7 +152,7 @@ function loadWorker(workerName: string): any {
     }
 
     if (tsxModulePath) {
-      return fork(workerTsPath, [], {
+      return childProcess.fork(workerTsPath, [], {
         execArgv: ['--max-old-space-size=2048', '-r', 'tsx/cjs'],
       })
     }
@@ -163,13 +164,25 @@ function loadWorker(workerName: string): any {
   throw new Error(`Worker file not found: ${workerTsPath}`)
 }
 
-/**
- * Worker Pool 类：管理多个子进程
- */
-class WorkerPool {
-  private workers: Array<{ worker: any; busy: boolean; id: number }> = []
+interface WorkerTask {
+  type: string
+  task: any
+  taskId: number
+  resolve: (result: any) => void
+  reject: (error: Error) => void
+}
 
-  private taskQueue: Array<{ type: string; task: any; taskId: number; resolve: any; reject: any }> = []
+interface WorkerSlot {
+  worker: any
+  task?: WorkerTask
+  fail: (reason: Error) => void
+}
+
+/** 子进程池。每个子进程一次只处理一个文件。 */
+class WorkerPool {
+  private workers = new Map<number, WorkerSlot>()
+
+  private taskQueue: WorkerTask[] = []
 
   private taskIdCounter = 0
 
@@ -181,10 +194,6 @@ class WorkerPool {
     workerStartTime: 0,
     workerWorkTimes: new Map<number, number>(),
   }
-
-  private lastWorkerIndex: number = 0
-
-  private pendingTasks: Map<number, any> = new Map()
 
   private terminated: boolean = false
 
@@ -221,59 +230,26 @@ class WorkerPool {
     try {
       const worker = loadWorker('parser-worker')
 
-      worker.on('message', (message: any) => {
-        this.handleWorkerMessage(id, message)
-      })
-
-      worker.on('error', (error: Error) => {
-        console.error(`Worker ${id} error:`, error)
-        if (error.message.includes('Cannot find module') || error.message.includes('ERR_MODULE_NOT_FOUND')) {
-          console.error(`Worker script not found or cannot be loaded: parser-worker`)
-          console.error(
-            'Falling back to single-threaded mode. Please compile TypeScript first or use --disable-workers flag.'
-          )
-          if (this.workers[id]) {
-            this.workers[id].busy = false
-          }
-          return
-        }
-        if (this.workers[id] && this.workers[id].worker) {
-          this.workers[id].worker.kill()
-          this.createWorker(id)
-        }
-      })
-
-      worker.on('exit', (code: number) => {
-        if (this.terminated) {
-          return
-        }
-        if (code !== 0) {
-          console.warn(`Worker ${id} exited with code ${code}`)
-          this.oomCount++
-          this.consecutiveFailures++
-          // 子进程非正常退出，reject 该 worker 所有 pending 任务
-          for (const [taskId, task] of this.pendingTasks.entries()) {
-            if (this.workers[id]?.busy) {
-              this.pendingTasks.delete(taskId)
-              task.reject(new Error(`Worker ${id} exited with code ${code} (possible OOM)`))
-            }
-          }
-          if (this.workers[id]) {
-            this.workers[id].busy = false
-          }
-          if (this.consecutiveFailures >= WorkerPool.MAX_CONSECUTIVE_FAILURES) {
-            console.error(`Worker consecutive failures reached ${this.consecutiveFailures}, stopping worker recreation`)
-            return
-          }
-          this.createWorker(id)
-        }
-      })
-
-      if (this.workers[id]) {
-        this.workers[id] = { worker, busy: false, id }
-      } else {
-        this.workers.push({ worker, busy: false, id })
+      const fail = (reason: Error): void => {
+        // Both 'error' and 'exit' may fire for the same child.
+        if (this.terminated || this.workers.get(id) !== slot) return
+        this.workers.delete(id)
+        slot.task?.reject(reason)
+        worker.kill()
+        this.oomCount++
+        this.consecutiveFailures++
+        if (this.consecutiveFailures < WorkerPool.MAX_CONSECUTIVE_FAILURES) this.createWorker(id)
+        this.processNextTask()
       }
+      const slot: WorkerSlot = { worker, fail }
+      this.workers.set(id, slot)
+      worker.on('message', (message: any) => {
+        if (this.workers.get(id) === slot) this.handleWorkerMessage(id, message)
+      })
+      worker.on('error', fail)
+      worker.on('exit', (code: number | null, signal: string | null) => {
+        fail(new Error(`Worker ${id} exited with ${signal || `code ${code}`}`))
+      })
     } catch (error) {
       console.error(`Failed to create worker ${id}:`, error)
     }
@@ -285,16 +261,12 @@ class WorkerPool {
    * @param {any} message - 消息
    */
   private handleWorkerMessage(workerId: number, message: any): void {
-    const worker = this.workers[workerId]
-    if (!worker) return
-
-    const task = this.pendingTasks.get(message.taskId)
-    if (!task) return
+    const worker = this.workers.get(workerId)
+    const task = worker?.task
+    if (!worker || !task || task.taskId !== message.taskId) return
 
     this.consecutiveFailures = 0
-
-    this.pendingTasks.delete(message.taskId)
-    worker.busy = false
+    worker.task = undefined
 
     if (message.workTime !== undefined && message.workTime > 0) {
       this.stats.totalWorkTime += message.workTime
@@ -317,24 +289,24 @@ class WorkerPool {
   private processNextTask(): void {
     if (this.taskQueue.length === 0) return
 
-    const idleWorkers = this.workers.filter((w) => !w.busy)
-    if (idleWorkers.length === 0) return
-
-    const selectedWorker = idleWorkers[this.lastWorkerIndex % idleWorkers.length]
-    this.lastWorkerIndex = (this.lastWorkerIndex + 1) % idleWorkers.length
-    const idleWorker = selectedWorker
-
-    const task = this.taskQueue.shift()
-    if (!task) return
-
-    idleWorker.busy = true
-    this.pendingTasks.set(task.taskId, task)
-
-    idleWorker.worker.send({
-      type: task.type,
-      task: task.task,
-      taskId: task.taskId,
-    })
+    if (!this.workers.size) {
+      const reason = new Error('No parser workers are available')
+      for (const task of this.taskQueue.splice(0)) task.reject(reason)
+      return
+    }
+    for (const slot of this.workers.values()) {
+      if (slot.task) continue
+      const task = this.taskQueue.shift()
+      if (!task) return
+      slot.task = task
+      try {
+        slot.worker.send({ type: task.type, task: task.task, taskId: task.taskId }, (error: Error | null) => {
+          if (error && slot.task === task) slot.fail(error)
+        })
+      } catch (error) {
+        slot.fail(error as Error)
+      }
+    }
   }
 
   /**
@@ -382,9 +354,8 @@ class WorkerPool {
         }
       }
     }
-    this.workers = []
+    this.workers.clear()
     this.taskQueue = []
-    this.pendingTasks.clear()
   }
 
   /**
@@ -392,7 +363,7 @@ class WorkerPool {
    * @returns {number} 活跃任务数
    */
   getActiveTaskCount(): number {
-    return this.taskQueue.length + this.workers.filter((w) => w.busy).length
+    return this.taskQueue.length + Array.from(this.workers.values()).filter((slot) => slot.task).length
   }
 
   /**
@@ -799,13 +770,18 @@ class BaseParser {
     code: string,
     options: Record<string, any>,
     config: LanguageParserConfig,
-    sourceCodeCache?: Map<string, string[]>
+    sourceCodeCache?: Map<string, string[]>,
+    retryAsWorker = false
   ): any {
     const parseResult = parseFileCore(filepath, code, options.language!, options, {
       unit: config.unit,
       needsSourcefile: config.needsSourcefile,
-    })
-    const { ast } = parseResult
+    }, retryAsWorker)
+    let { ast } = parseResult
+    if (ast && retryAsWorker) {
+      // A JSON IPC round trip gives repeated UAST nodes independent identities.
+      ast = processParsedAstCore(JSON.parse(stringifyJsonWithFallback(ast)), null, options, config, true)
+    }
 
     // 如果 parse 失败返回 null，清理 sourceCodeCache，避免后续代码误认为文件已处理
     if (!ast && sourceCodeCache && sourceCodeCache.get(filepath)) {
@@ -1018,6 +994,7 @@ class BaseParser {
 
     // 4. 合并缓存结果和解析结果
     // 注意：最终返回的 AST 必须包含 parent 属性（用于后续分析）
+    const parsedByFile = new Map(parsedResults.map((result) => [result.file, result]))
     const results = files.map((file: FileContent) => {
       const cached = cachedResults.get(file.file)
       if (cached) {
@@ -1039,7 +1016,7 @@ class BaseParser {
       }
       // 新解析的 AST 已经通过 processParsedAstCore 处理，包含 parent
       return (
-        parsedResults.find((r) => r.file === file.file) || {
+        parsedByFile.get(file.file) || {
           file: file.file,
           content: file.content,
           ast: null,
@@ -1089,73 +1066,68 @@ class BaseParser {
     let parsedResults: ParseResult[] = []
 
     if (shouldUseWorkers && workerPool) {
-      // 使用子进程模式
-      const parsePromises = files.map(async (file: FileContent): Promise<ParseResult> => {
-        // OOM 降级：累计 2 次非正常退出后，后续文件走主线程
-        if (workerPool.oomCount >= 2) {
-          const fileOptions = { ...options, sourcefile: file.file }
-          const ast = this.parseFile(file.file, file.content, fileOptions, config, sourceCodeCache)
-          return { file: file.file, content: file.content, ast }
+      try {
+        const workerConfig = {
+          unit: config.unit,
+          needsSourcefile: config.needsSourcefile,
+          maindirPrefix: Config.maindirPrefix,
+          ...(language === 'c' || language === 'cpp' ? {
+            maindir: Config.maindir,
+            cPreprocessor: Config.cPreprocessor,
+          } : {}),
         }
-
-        const minimalOptions: Record<string, any> = { sourcefile: file.file }
-        if (language === 'javascript' || language === 'js') {
-          minimalOptions.sanity = options.sanity
-        }
-
-        SourceLine.storeCode(file.file, file.content)
-
-        try {
-          const parseResult = await workerPool.submitTask('parse', {
-            filepath: file.file,
-            content: file.content,
-            language,
-            options: minimalOptions,
-            config: {
-              unit: config.unit,
-              needsSourcefile: config.needsSourcefile,
-              maindirPrefix: Config.maindirPrefix,
-              ...(language === 'c' || language === 'cpp' ? {
-                maindir: Config.maindir,
-                cPreprocessor: Config.cPreprocessor,
-              } : {}),
-            },
-          })
-
-          if (parseResult.error) {
-            logger.warn(`Failed to parse ${file.file} in worker: ${parseResult.error}`)
-            return { file: file.file, content: file.content, ast: null }
+        const tasks = files.map(async (file) => {
+          SourceLine.storeCode(file.file, file.content)
+          const parseOptions: Record<string, any> = { sourcefile: file.file }
+          if (language === 'javascript' || language === 'js') parseOptions.sanity = options.sanity
+          try {
+            const result = await workerPool.submitTask('parse', {
+              filepath: file.file,
+              content: file.content,
+              language,
+              options: parseOptions,
+              config: workerConfig,
+            })
+            return { result, parseOptions }
+          } catch (error) {
+            return { parseOptions, failure: error as Error }
           }
+        })
 
-          // 子进程已做完整 processAst，但 IPC 序列化丢了 parent，补回来
-          const fileOptions = { ...minimalOptions, sourcefile: file.file }
-          const ast = processParsedAstCore(parseResult.ast, file.content, fileOptions, config, true)
-          return { file: file.file, content: file.content, ast }
-        } catch (error) {
-          // 子进程崩溃（OOM 等），回退到主线程重试
-          logger.warn(`Worker failed for ${file.file}: ${(error as Error).message}, retrying on main thread`)
-          const fileOptions = { ...options, sourcefile: file.file }
-          const ast = this.parseFile(file.file, file.content, fileOptions, config, sourceCodeCache)
-          return { file: file.file, content: file.content, ast }
+        // Run parsers concurrently, but register each file's hashes in source order.
+        // Hash collisions overwrite the ASTManager entry, so completion order matters.
+        for (const [index, task] of tasks.entries()) {
+          const file = files[index]
+          const { result, parseOptions, failure } = await task
+          let ast = null
+          if (failure) {
+            logger.warn(`Worker failed for ${file.file}: ${failure.message}, retrying on main thread`)
+            const retryAsWorker = language === 'c' || language === 'cpp'
+            const retryOptions = retryAsWorker ? { ...parseOptions, language } : { ...options, sourcefile: file.file }
+            ast = this.parseFile(file.file, file.content, retryOptions, config, sourceCodeCache, retryAsWorker)
+          } else if (result.error) {
+            logger.warn(`Failed to parse ${file.file} in worker: ${result.error}`)
+          } else {
+            const workerMode = language === 'c' ? 'restore' : undefined
+            ast = processParsedAstCore(result.ast, null, parseOptions, config, true, workerMode)
+          }
+          parsedResults.push({ ...file, ast })
         }
-      })
 
-      parsedResults = await Promise.all(parsePromises)
-
-      // 打印子进程性能统计
-      const workerStats = workerPool.getStats()
-      if (workerStats.workerWorkTimes) {
-        const workerTimeStr = Object.entries(workerStats.workerWorkTimes)
-          .map(([workerId, time]) => `W${workerId}:${(time as number).toFixed(0)}ms`)
-          .join(', ')
-        yasaLog(`Work time: ${workerTimeStr}`, PREPROCESS_PARSE_CODE_STAGE)
+        // 打印子进程性能统计
+        const workerStats = workerPool.getStats()
+        if (workerStats.workerWorkTimes) {
+          const workerTimeStr = Object.entries(workerStats.workerWorkTimes)
+            .map(([workerId, time]) => `W${workerId}:${(time as number).toFixed(0)}ms`)
+            .join(', ')
+          yasaLog(`Work time: ${workerTimeStr}`, PREPROCESS_PARSE_CODE_STAGE)
+        }
+        if (workerPool.oomCount > 0) {
+          yasaLog(`OOM fallbacks: ${workerPool.oomCount}`, PREPROCESS_PARSE_CODE_STAGE)
+        }
+      } finally {
+        await this.cleanupWorkerPool()
       }
-      if (workerPool.oomCount > 0) {
-        yasaLog(`OOM fallbacks: ${workerPool.oomCount}`, PREPROCESS_PARSE_CODE_STAGE)
-      }
-
-      // 解析完成后立即释放子进程池
-      await this.cleanupWorkerPool()
     } else {
       // 使用 Promise 并发解析
       parsedResults = await this.limitConcurrency<ParseResult>(

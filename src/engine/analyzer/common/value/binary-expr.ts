@@ -11,6 +11,20 @@ interface BinaryExprOptions {
   arithAssign?: boolean
 }
 
+const leftDescriptor = {
+  get(this: BinaryExprValue) { return this._leftRef?.resolve(this.getSymbolTable()) ?? null },
+  set(this: BinaryExprValue, val: Unit | null) { this._leftRef = val != null ? this._makeValueRefDirect(val) : null },
+  enumerable: true,
+  configurable: true,
+}
+
+const rightDescriptor = {
+  get(this: BinaryExprValue) { return this._rightRef?.resolve(this.getSymbolTable()) ?? null },
+  set(this: BinaryExprValue, val: Unit | null) { this._rightRef = val != null ? this._makeValueRefDirect(val) : null },
+  enumerable: true,
+  configurable: true,
+}
+
 /**
  * BinaryExprValue - 二元运算表达式（a + b, a > b, ...）
  *
@@ -40,18 +54,8 @@ export class BinaryExprValue extends ExprValue {
     this.arithAssign = arithAssign
     Object.defineProperty(this, '_leftRef', { value: this._makeValueRefDirect(left), writable: true, enumerable: false, configurable: true })
     Object.defineProperty(this, '_rightRef', { value: this._makeValueRefDirect(right), writable: true, enumerable: false, configurable: true })
-    Object.defineProperty(this, 'left', {
-      get(this: BinaryExprValue) { return this._leftRef?.resolve(this.getSymbolTable()) ?? null },
-      set(this: BinaryExprValue, val: Unit | null) { this._leftRef = val != null ? this._makeValueRefDirect(val) : null },
-      enumerable: true,
-      configurable: true,
-    })
-    Object.defineProperty(this, 'right', {
-      get(this: BinaryExprValue) { return this._rightRef?.resolve(this.getSymbolTable()) ?? null },
-      set(this: BinaryExprValue, val: Unit | null) { this._rightRef = val != null ? this._makeValueRefDirect(val) : null },
-      enumerable: true,
-      configurable: true,
-    })
+    Object.defineProperty(this, 'left', leftDescriptor)
+    Object.defineProperty(this, 'right', rightDescriptor)
   }
 
   static fromOpts(upperQid: string, opts: BinaryExprOptions): BinaryExprValue {

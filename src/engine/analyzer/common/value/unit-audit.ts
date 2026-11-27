@@ -188,7 +188,7 @@ function writeAuditRecord(rec: AuditRecord): void {
 }
 
 /** 快速通道：flag off 时所有 audit*Event 直接返回，省 safeRecordEdge / loadDataflowModule 调用开销 */
-function isAuditFastOff(): boolean {
+export function isAuditFastOff(): boolean {
   if (UNIT_AUDIT_ENABLED) return false
   if (!Config.dataflowDb) return true
   loadDataflowModule()

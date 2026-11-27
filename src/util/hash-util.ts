@@ -6,6 +6,7 @@ import * as crypto from 'crypto'
  * @returns MD5 哈希值（32位十六进制字符串）
  */
 function md5(str: string): string {
+  if (typeof crypto.hash === 'function') return crypto.hash('md5', str, 'hex')
   return crypto.createHash('md5').update(str).digest('hex')
 }
 

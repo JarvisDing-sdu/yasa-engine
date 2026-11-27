@@ -14,6 +14,47 @@ interface GraphEdge {
   opts: any
 }
 
+// A hash can appear under several display names. Any live representative suffices
+// for a positive lookup. On a miss the line-based check also covers other hashes.
+const definitionRepresentatives = new WeakMap<Map<string, GraphNode>, Map<string, string>>()
+
+export function graphHasFunctionDefinition(
+  nodes: Map<string, GraphNode>,
+  definition: any,
+  astManager?: { get(hash: string): any }
+): boolean {
+  const loc = definition.loc
+  if (!loc?.start?.line || !loc.end?.line) return false
+  function matches(node: GraphNode): boolean {
+    const opts = node.opts
+    const candidate = opts?.funcDefNodehash && astManager ? astManager.get(opts.funcDefNodehash) : opts?.funcDef
+    return candidate?.loc?.sourcefile === loc.sourcefile &&
+      candidate?.loc?.start?.line === loc.start.line && candidate?.loc?.end?.line === loc.end.line
+  }
+  const hash = definition._meta?.nodehash
+  let representatives = definitionRepresentatives.get(nodes)
+  if (!representatives) {
+    representatives = new Map()
+    // Graphs restored from disk already contain nodes before the first query.
+    for (const [id, node] of nodes) {
+      if (node.opts?.funcDefNodehash) representatives.set(node.opts.funcDefNodehash, id)
+    }
+    definitionRepresentatives.set(nodes, representatives)
+  }
+  const representativeId = representatives.get(hash)
+  if (representativeId !== undefined) {
+    const node = nodes.get(representativeId)
+    if (node && matches(node)) return true
+  }
+  for (const node of nodes.values()) {
+    if (matches(node)) {
+      if (hash) representatives.set(hash, node.id)
+      return true
+    }
+  }
+  return false
+}
+
 /** 调用点位置三元组，用于区分同一 caller→callee 的不同调用行 */
 interface CallSiteLoc {
   sourcefile?: string
@@ -64,6 +105,7 @@ class GraphClass {
     node_id = this.relativePathsInNodeId(node_id)
     const node: GraphNode = { id: node_id, opts }
     this.nodes.set(node_id, node)
+    if (opts?.funcDefNodehash) definitionRepresentatives.get(this.nodes)?.set(opts.funcDefNodehash, node_id)
     return node
   }
 

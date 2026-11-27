@@ -1,6 +1,33 @@
 import { ValueRef } from './value-ref'
 import type Unit from './unit'
 import { RAW_TARGET } from './symbols'
+import { auditSlotBindEvent } from './unit-audit'
+
+// Structural snapshots belong to the backing map, including while it is shared
+// by COW clones. They are intentionally absent from serialized analyzer state.
+const mergeKeySnapshots = new WeakMap<Map<string, ValueRef>, readonly string[]>()
+const noMergeKeys: readonly string[] = Object.freeze([])
+
+type MergeSnapshot = {
+  readonly token: object
+  readonly keys: readonly string[]
+  readonly uuids: readonly (string | undefined)[]
+  readonly positions: SymbolPosition[]
+}
+
+export interface MergeBindingObserver {
+  active: boolean
+  bind(members: ValueRefMap, key: string, uuid: string, value: any, initial?: boolean): void
+  invalidate(): void
+}
+
+export interface SymbolPosition {
+  table: object
+  uuid: string
+  index: number
+}
+
+const exposedMaps = new WeakSet<Map<string, ValueRef>>()
 
 /**
  * ValueStore — 符号表只读接口
@@ -14,6 +41,7 @@ export interface ValueStore {
  */
 export interface ValueRegistry extends ValueStore {
   register(value: Unit): string | null
+  getAtPosition?(uuid: string, positions: SymbolPosition[], index: number): Unit | null | undefined
 }
 
 /**
@@ -39,17 +67,43 @@ export interface ValueRegistry extends ValueStore {
  */
 export class ValueRefMap {
   /** 内部数据主体。COW 共享时写前须调 _ensureMapOwned，外部禁止直接写 */
-  _map: Map<string, ValueRef> = new Map()
+  // Keep join state out of serialized models. The public _map retains the
+  // enumerable, assignable property used by cache and COW readers.
+  #bindings: Map<string, ValueRef> = new Map()
+  #sharedRefs = false
+  #observer?: MergeBindingObserver
+  #mergeSnapshot?: MergeSnapshot
+
+  get _map(): Map<string, ValueRef> {
+    // Raw refs can be changed by callers even after their original slot was rebound.
+    this.#sharedRefs = true
+    this.#mergeSnapshot = undefined
+    this.#observer?.invalidate()
+    exposedMaps.add(this.#bindings)
+    return this.#bindings
+  }
+
+  set _map(map: Map<string, ValueRef>) {
+    this.#bindings = map
+    this.#sharedRefs = true
+    this.#mergeSnapshot = undefined
+    this.#observer?.invalidate()
+    exposedMaps.add(map)
+  }
   /** COW 标记：true 表示 _map 与其他实例共享，写前须拷贝 */
-  private _mapShared: boolean = false
-  private _getSymbolTable: () => ValueRegistry | null
-  private _getOwner: (() => Unit | null) | null
-  private _proxy: any
-  private _proxyTarget: Record<string, any> = {}
+  declare private _mapShared: boolean
+  declare private _getSymbolTable: () => ValueRegistry | null
+  declare private _getOwner: (() => Unit | null) | null
+  declare private _proxy: any
+  declare private _proxyTarget: Record<string, any>
 
   constructor(getSymbolTable: () => ValueRegistry | null, getOwner?: () => Unit | null) {
+    Object.defineProperty(this, '_map', rawMapProperty)
+    this._mapShared = false
     this._getSymbolTable = getSymbolTable
     this._getOwner = getOwner || null
+    this._proxy = undefined
+    this._proxyTarget = {}
     this._proxy = this._createProxy()
     Object.defineProperty(this._proxy, RAW_TARGET, {
       value: this._proxyTarget,
@@ -59,8 +113,20 @@ export class ValueRefMap {
     })
   }
 
+  observeMergeBindings(observer: MergeBindingObserver): boolean {
+    if (this.#sharedRefs || exposedMaps.has(this.#bindings) || !this.hasStandardPrototype()) return false
+    this.#observer = observer
+    const st = this._getSymbolTable()
+    for (const [key, ref] of this.#bindings) {
+      if (!ref.uuid || key === '_map' || key === '_owner' || key === 'hasOwnProperty') return false
+      if (!observer.active) return false
+      observer.bind(this, key, ref.uuid, ref.resolve(st), true)
+    }
+    return true
+  }
+
   get size(): number {
-    return this._map.size
+    return this.#bindings.size
   }
 
   getProxy(): any {
@@ -68,7 +134,7 @@ export class ValueRefMap {
   }
 
   get(key: string): any {
-    const ref = this._map.get(key)
+    const ref = this.#bindings.get(key)
     if (!ref) return null
     const st = this._getSymbolTable()
     const resolved = ref.resolve(st)
@@ -78,20 +144,20 @@ export class ValueRefMap {
   }
 
   has(key: string): boolean {
-    return this._map.has(key)
+    return this.#bindings.has(key)
   }
 
-  set(key: string, value: Unit | ValueRef | null | undefined): void {
+  set(key: string, value: Unit | ValueRef | null | undefined, snapshot?: object, index?: number): void {
     this._ensureMapOwned()
-    this._setInternal(key, value)
+    const size = this.#bindings.size
+    this._setInternal(key, value, snapshot, index)
+    if (this.#bindings.size !== size) mergeKeySnapshots.delete(this.#bindings)
     // v5 hook #5：slot_bind 事件。每次成功 set 记一条边（value → ownerUnit）
     // delete 语义（value==null）不记边
     if (value != null && this._getOwner) {
       const owner = this._getOwner()
       if (owner) {
         try {
-          // eslint-disable-next-line @typescript-eslint/no-var-requires
-          const { auditSlotBindEvent } = require('./unit-audit')
           auditSlotBindEvent(value, owner, key)
         } catch (_e) {
           // 插桩失败不影响原逻辑
@@ -100,18 +166,26 @@ export class ValueRefMap {
     }
   }
 
-  private _setInternal(key: string, value: Unit | ValueRef | null | undefined): void {
+  private _setInternal(
+    key: string, value: Unit | ValueRef | null | undefined, snapshot?: object, index?: number,
+  ): void {
     if (value == null) {
-      this._map.delete(key)
+      this.#mergeSnapshot = undefined
+      this.#bindings.delete(key)
       return
     }
     if (value instanceof ValueRef) {
-      this._map.set(key, value)
+      this.#sharedRefs = true
+      this.#mergeSnapshot = undefined
+      this.#bindings.set(key, value)
+      this.#observer?.invalidate()
       return
     }
     // UUID string → pure reference (no direct object available)
     if (typeof value === 'string' && (value as any).startsWith('symuuid')) {
-      this._map.set(key, new ValueRef(value as any))
+      this.#mergeSnapshot = undefined
+      this.#bindings.set(key, new ValueRef(value as any))
+      this.notifyMergeBinding(key, value as any, value)
       return
     }
     // Register Unit values in ST, store UUID-only ref (no _direct)。
@@ -121,37 +195,120 @@ export class ValueRefMap {
       if (st) {
         const uuid = st.register(value as Unit)
         if (uuid) {
-          this._map.set(key, new ValueRef(uuid))
+          const prior = this.mergeUUID(key, snapshot, index) ?? this.#bindings.get(key)?.uuid
+          if (this.#sharedRefs || prior !== uuid) {
+            this.#mergeSnapshot = undefined
+            this.#bindings.set(key, new ValueRef(uuid))
+            this.notifyMergeBinding(key, uuid, value)
+          }
           return
         }
       }
     }
     // Non-Unit values or ST unavailable: store with whatever UUID is available
+    this.#mergeSnapshot = undefined
     const uuid = value?.uuid || ''
     if (uuid) {
-      this._map.set(key, new ValueRef(uuid))
+      this.#bindings.set(key, new ValueRef(uuid))
     } else {
-      this._map.set(key, new ValueRef('', value))
+      this.#bindings.set(key, new ValueRef('', value))
     }
+    this.notifyMergeBinding(key, uuid, value)
+  }
+
+  private notifyMergeBinding(key: string, uuid: string, value: any): void {
+    if (!this.#observer?.active) return
+    if (!uuid || this.#sharedRefs || key === '_map' || key === '_owner' || key === 'hasOwnProperty') this.#observer.invalidate()
+    else this.#observer.bind(this, key, uuid, value)
   }
 
   delete(key: string): boolean {
     this._ensureMapOwned()
-    return this._map.delete(key)
+    this.#mergeSnapshot = undefined
+    const removed = this.#bindings.delete(key)
+    if (removed) mergeKeySnapshots.delete(this.#bindings)
+    return removed
   }
 
   clear(): void {
     this._ensureMapOwned()
-    this._map.clear()
+    this.#mergeSnapshot = undefined
+    this.#bindings.clear()
+    mergeKeySnapshots.delete(this.#bindings)
   }
 
   keys(): IterableIterator<string> {
-    return this._map.keys()
+    return this.#bindings.keys()
+  }
+
+  /** for-in snapshots keys before the join can rebind any symbols. */
+  mergeKeys(): readonly string[] {
+    if (this.#bindings.size === 0) return noMergeKeys
+    if (this.#sharedRefs && exposedMaps.has(this.#bindings)) return Array.from(this.#bindings.keys())
+    let keys = mergeKeySnapshots.get(this.#bindings)
+    if (!keys) {
+      keys = Array.from(this.#bindings.keys())
+      mergeKeySnapshots.set(this.#bindings, keys)
+    }
+    return keys
+  }
+
+  prepareMergeSnapshot(keys: readonly string[]): object | undefined {
+    // Large scopes repeatedly visit the same function bindings. Small maps
+    // cost less to read directly. Only internally owned UUID refs are pure.
+    if (this.#sharedRefs || keys.length < 64 || keys !== mergeKeySnapshots.get(this.#bindings)) return undefined
+    if (!this.#mergeSnapshot) {
+      const uuids = keys.map(key => {
+        if (key === '_map' || key === '_owner' || key === 'hasOwnProperty') return undefined
+        return this.#bindings.get(key)?.uuid || undefined
+      })
+      this.#mergeSnapshot = { token: {}, keys: keys.slice(), uuids, positions: [] }
+    }
+    return this.#mergeSnapshot.token
+  }
+
+  private mergeUUID(key: string, snapshot?: object, index?: number): string | undefined {
+    const batch = this.#mergeSnapshot
+    if (!batch || batch.token !== snapshot || index === undefined || batch.keys[index] !== key) return undefined
+    return batch.uuids[index]
+  }
+
+  hasEnumerableMergeKey(key: string, snapshot?: object, index?: number): boolean {
+    if (this.mergeUUID(key, snapshot, index)) return true
+    const ref = this.#bindings.get(key)
+    if (!ref) return false
+    // for-in runs the proxy descriptor trap before reading the field. UUID-only
+    // descriptors are pure; direct refs can invoke a custom resolver there.
+    return !!ref.uuid || Object.prototype.propertyIsEnumerable.call(this._proxy, key)
+  }
+
+  readMergeField(key: string, snapshot?: object, index?: number): any {
+    const uuid = this.mergeUUID(key, snapshot, index)
+    if (!uuid) return this.readField(key)
+    const positions = this.#mergeSnapshot!.positions
+    const st = this._getSymbolTable()
+    if (st?.getAtPosition) return st.getAtPosition(uuid, positions, index!) || uuid
+    return (typeof st?.get === 'function' && st.get(uuid)) || uuid
+  }
+
+  readField(key: string): any {
+    if (key === '_map') return this._map
+    if (key === '_owner') return this
+    if (key === 'hasOwnProperty') return (name: string) => this.#bindings.has(name)
+    const ref = this.#bindings.get(key)
+    if (!ref) return this._proxyTarget[key]
+    return ref.resolve(this._getSymbolTable()) || ref.uuid || undefined
+  }
+
+  hasStandardPrototype(): boolean {
+    if (Object.getPrototypeOf(this._proxyTarget) !== Object.prototype) return false
+    for (const _key in Object.prototype) return false
+    return true
   }
 
   forEach(fn: (value: any, key: string) => void): void {
     const st = this._getSymbolTable()
-    for (const [key, ref] of this._map) {
+    for (const [key, ref] of this.#bindings) {
       const value = ref.resolve(st)
       if (value) fn(value, key)
     }
@@ -160,7 +317,7 @@ export class ValueRefMap {
   entries(): [string, any][] {
     const st = this._getSymbolTable()
     const result: [string, any][] = []
-    for (const [key, ref] of this._map) {
+    for (const [key, ref] of this.#bindings) {
       const value = ref.resolve(st)
       if (value) result.push([key, value])
     }
@@ -170,7 +327,7 @@ export class ValueRefMap {
   /** COW 写时拷贝：共享 Map 在首次写前拆分为独立副本 */
   private _ensureMapOwned(): void {
     if (this._mapShared) {
-      this._map = new Map(this._map)
+      this.#bindings = new Map(this.#bindings)
       this._mapShared = false
     }
   }
@@ -180,18 +337,7 @@ export class ValueRefMap {
     return new Proxy(this._proxyTarget, {
       get(_target, prop) {
         if (typeof prop === 'symbol') return (_target as any)[prop]
-        if (typeof prop === 'string') {
-          if (prop === '_map') return self._map as ReadonlyMap<string, ValueRef>
-          if (prop === '_owner') return self
-          if (prop === 'hasOwnProperty') return (key: string) => self._map.has(key)
-          const ref = self._map.get(prop)
-          if (!ref) return _target[prop]
-          const st = self._getSymbolTable()
-          const resolved = ref.resolve(st)
-          if (resolved) return resolved
-          if (ref.uuid) return ref.uuid
-          return undefined
-        }
+        if (typeof prop === 'string') return self.readField(prop)
         return undefined
       },
 
@@ -211,15 +357,20 @@ export class ValueRefMap {
         return false
       },
 
+      setPrototypeOf(target, proto) {
+        self.#observer?.invalidate()
+        return Reflect.setPrototypeOf(target, proto)
+      },
+
       has(_target, prop) {
         if (typeof prop === 'string') {
-          return self._map.has(prop)
+          return self.#bindings.has(prop)
         }
         return false
       },
 
       ownKeys(_target) {
-        const keys: (string | symbol)[] = Array.from(self._map.keys())
+        const keys: (string | symbol)[] = Array.from(self.#bindings.keys())
         if (Object.prototype.hasOwnProperty.call(_target, RAW_TARGET)) {
           keys.push(RAW_TARGET)
         }
@@ -227,8 +378,8 @@ export class ValueRefMap {
       },
 
       getOwnPropertyDescriptor(_target, prop) {
-        if (typeof prop === 'string' && self._map.has(prop)) {
-          const ref = self._map.get(prop)!
+        if (typeof prop === 'string' && self.#bindings.has(prop)) {
+          const ref = self.#bindings.get(prop)!
           // uuid 非空返回 UUID string（保持旧 _target[prop] 语义）；
           // uuid 为空时回退 resolve/direct，避免 desc.value 退化为 ''
           const value = ref.uuid
@@ -254,9 +405,10 @@ export class ValueRefMap {
     const entries = data instanceof Map ? data.entries() : Object.entries(data)
     for (const [key, value] of entries) {
       if (value instanceof ValueRef) {
-        map._map.set(key, value)
+        map.#sharedRefs = true
+        map.#bindings.set(key, value)
       } else if (typeof value === 'string') {
-        map._map.set(key, new ValueRef(value))
+        map.#bindings.set(key, new ValueRef(value))
       }
     }
     return map
@@ -267,9 +419,18 @@ export class ValueRefMap {
     // COW：共享 _map 引用不拷贝，写时由 _ensureMapOwned 拆分为独立副本。
     // 不守 size>0：空 map 克隆时若不置 _mapShared，任一侧 set 直接写共享对象、
     // 两侧互相污染,_map 异常增长 → satisfy BFS 触达 2^32-1 抛 RangeError。
-    copy._map = this._map
+    this.#observer?.invalidate()
+    this.#mergeSnapshot = undefined
+    copy.#bindings = this.#bindings
+    this.#sharedRefs = true
+    copy.#sharedRefs = true
     this._mapShared = true
     copy._mapShared = true
     return copy
   }
+}
+
+const rawMapProperty = {
+  ...Object.getOwnPropertyDescriptor(ValueRefMap.prototype, '_map')!,
+  enumerable: true,
 }

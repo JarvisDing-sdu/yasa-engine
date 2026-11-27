@@ -1,3 +1,4 @@
+import { beginCNamespaceJoins, endCNamespaceJoins } from '../../engine/analyzer/common/global-branch-watch'
 import type TypeRelatedInfoResolver from '../../resolver/common/type-related-info-resolver'
 import type { ClassHierarchy } from '../../resolver/common/value/class-hierarchy'
 import type { Invocation } from '../../resolver/common/value/invocation'
@@ -132,15 +133,28 @@ function makeFullCallGraph(analyzer: any): void {
   config.loadExternalRule = true
   const backupCheckerManager = analyzer.checkerManager
   analyzer.checkerManager = newCheckerManager
+  const watchCGlobals = config.language === 'c'
+  if (watchCGlobals) beginCNamespaceJoins(analyzer.topScope)
+  try {
+    interpretCallGraphFunctions(analyzer)
+  } finally {
+    if (watchCGlobals) endCNamespaceJoins(analyzer.topScope)
+    analyzer.checkerManager = backupCheckerManager
+    config.makeAllCG = false
+  }
+  performanceTracker.end(`startAnalyze.makeFullCallGraph(BySymbolInterpret)`)
+}
+
+function interpretCallGraphFunctions(analyzer: any): void {
   analyzer.ainfo.callgraph = analyzer.ainfo.callgraph || new Graph()
   if (analyzer.ainfo.callgraph && Object.keys(analyzer.topScope.context.funcs).length > 0) {
-    const alreadyCheckList: any[] = [] // 分析过的callnode一定会出现在nodes中
+    const checkedFunctions = new Set<object>()
     for (const node of analyzer.ainfo.callgraph.nodes.values()) {
       // 从 UUID 还原 funcSymbol
       if (node.opts?.funcSymbolUuid) {
         const funcSymbol = analyzer.symbolTable.get(node.opts.funcSymbolUuid)
         if (funcSymbol) {
-          alreadyCheckList.push(funcSymbol)
+          checkedFunctions.add(funcSymbol)
         }
       }
     }
@@ -148,7 +162,7 @@ function makeFullCallGraph(analyzer: any): void {
     Object.entries(analyzer.topScope.context.funcs).forEach(([key, funcSymbol]) => {
       const funcSymbolAny = funcSymbol as any
       if (
-        !alreadyCheckList.includes(funcSymbolAny) &&
+        !checkedFunctions.has(funcSymbolAny) &&
         funcSymbolAny.ast.fdef &&
         funcSymbolAny.ast.fdef.type === 'FunctionDefinition'
       ) {
@@ -177,11 +191,11 @@ function makeFullCallGraph(analyzer: any): void {
       }
       const funcSymbolAny2 = funcSymbol as any
       if (
-        !alreadyCheckList.includes(funcSymbolAny2) &&
+        !checkedFunctions.has(funcSymbolAny2) &&
         funcSymbolAny2.ast.fdef &&
         funcSymbolAny2.ast.fdef.type === 'FunctionDefinition'
       ) {
-        alreadyCheckList.push(funcSymbolAny2)
+        checkedFunctions.add(funcSymbolAny2)
         analyzer.executeCall(
           funcSymbolAny2.ast.fdef,
           funcSymbolAny2,
@@ -192,9 +206,6 @@ function makeFullCallGraph(analyzer: any): void {
     })
     logger.info('\tmakeAllCG-100%')
   }
-  analyzer.checkerManager = backupCheckerManager
-  config.makeAllCG = false
-  performanceTracker.end(`startAnalyze.makeFullCallGraph(BySymbolInterpret)`)
 }
 
 /**

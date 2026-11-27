@@ -48,6 +48,19 @@ const analyzerLanguage: Record<string, string> = {
   CFamilyAnalyzer: 'cpp',
 }
 
+const analyzerLoaders = new Map<string, () => any>([
+  ['JavaScriptAnalyzer', () => require('../engine/analyzer/javascript/common/js-analyzer')],
+  ['EggAnalyzer', () => require('../engine/analyzer/javascript/egg/egg-analyzer')],
+  ['JavaAnalyzer', () => require('../engine/analyzer/java/common/java-analyzer')],
+  ['SpringAnalyzer', () => require('../engine/analyzer/java/spring/spring-analyzer')],
+  ['GoAnalyzer', () => require('../engine/analyzer/golang/common/go-analyzer')],
+  ['PythonAnalyzer', () => require('../engine/analyzer/python/common/python-analyzer')],
+  ['PhpAnalyzer', () => require('../engine/analyzer/php/common/php-analyzer')],
+  ['CAnalyzer', () => require('../engine/analyzer/c/common/c-analyzer')],
+  ['CppAnalyzer', () => require('../engine/analyzer/cpp/common/cpp-analyzer')],
+  ['CFamilyAnalyzer', () => require('../engine/analyzer/c-family/c-family-analyzer')],
+])
+
 type CallSummaryMode = (typeof CALL_SUMMARY_MODES)[number]
 type CallSummaryStageStrategy = 'bypass' | 'skip-only'
 type CallSummaryStageName = 'processModule' | 'symbolInterpret'
@@ -867,39 +880,9 @@ async function initAnalyzer(dir: any, args: any[] = [], printf?: any) {
   // prepare the output and report directories
   cleanReportDir(Config.reportDir)
 
-  const JavaScriptAnalyzer = require('../engine/analyzer/javascript/common/js-analyzer')
-  const EggAnalyzer = require('../engine/analyzer/javascript/egg/egg-analyzer')
-
-  const JavaAnalyzer = require('../engine/analyzer/java/common/java-analyzer')
-  const SpringAnalyzer = require('../engine/analyzer/java/spring/spring-analyzer')
-
-  const GoAnalyzer = require('../engine/analyzer/golang/common/go-analyzer')
-
-  const PythonAnalyzer = require('../engine/analyzer/python/common/python-analyzer')
-
-  const PhpAnalyzer = require('../engine/analyzer/php/common/php-analyzer')
-
-  const CAnalyzer = require('../engine/analyzer/c/common/c-analyzer')
-
-  const CppAnalyzer = require('../engine/analyzer/cpp/common/cpp-analyzer')
-
-  const CFamilyAnalyzer = require('../engine/analyzer/c-family/c-family-analyzer')
-
-  const analyzerEnum = {
-    EggAnalyzer,
-    JavaScriptAnalyzer,
-    JavaAnalyzer,
-    GoAnalyzer,
-    SpringAnalyzer,
-    PythonAnalyzer,
-    PhpAnalyzer,
-    CAnalyzer,
-    CppAnalyzer,
-    CFamilyAnalyzer,
-  }
   let Analyzer: any
   if (Config.analyzer && Config.analyzer !== '') {
-    Analyzer = (analyzerEnum as any)[Config.analyzer]
+    Analyzer = analyzerLoaders.get(Config.analyzer)?.()
     Config.language = (analyzerLanguage as any)[Config.analyzer]
     if (!Analyzer || Analyzer === '') {
       handleException(
@@ -945,7 +928,7 @@ async function initAnalyzer(dir: any, args: any[] = [], printf?: any) {
       }
     }
     Config.analyzer = f
-    Analyzer = (analyzerEnum as any)[Config.analyzer]
+    Analyzer = analyzerLoaders.get(Config.analyzer)?.()
   }
   // C loads Tree-sitter WASM asynchronously, while analyzer internals use
   // the synchronous parseSingleFile interface. Other languages retain upstream initialization.

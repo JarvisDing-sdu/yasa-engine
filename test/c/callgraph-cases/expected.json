@@ -162,6 +162,40 @@
     "leaf"
    ],
    "mustNot": []
+  },
+  "main.c:use_initializer": {
+   "must": ["leaf"],
+   "mustNot": ["stray"]
+  },
+  "main.c:dispatch": {
+   "must": ["leaf"],
+   "mustNot": ["stray"]
   }
+ },
+ "G_tag_and_function": {
+  "tags.c:run": {
+   "must": ["status"],
+   "mustNot": []
+  },
+  "tags.c:status": {
+   "must": ["read_status"],
+   "mustNot": []
+  }
+ },
+ "H_break_exit": {
+  "loop.c:optional_break": { "must": ["after"], "mustNot": [] },
+  "loop.c:nested_switch": { "must": [], "mustNot": ["after"] },
+  "loop.c:constant_false_break": { "must": [], "mustNot": ["after"] }
+ },
+ "I_nested_local_callback": {
+  "dispatch.c:nested": { "must": ["red", "blue", "green"], "mustNot": ["amber"] },
+  "dispatch.c:overwritten": { "must": ["blue", "green", "amber"], "mustNot": ["red"] },
+  "dispatch.c:partial": { "must": ["red", "blue", "amber"], "mustNot": ["green"] },
+  "dispatch.c:early": { "must": ["green", "amber"], "mustNot": ["red", "blue"] },
+  "dispatch.c:goto_past": { "must": ["green", "amber"], "mustNot": ["red", "blue"] },
+  "dispatch.c:goto_call": { "must": ["blue", "green", "amber"], "mustNot": ["red"] }
+ },
+ "J_compound_or": {
+  "compound.c:set_bits": { "must": ["slot", "mask"], "mustNot": [] }
  }
 }

@@ -1,3 +1,4 @@
+import { invalidateJoinIdentity } from './join-observer'
 import { AstBinding } from './ast-binding'
 import { ValueRef } from './value-ref'
 import { ScopeCtx } from './scope-ctx'
@@ -190,6 +191,7 @@ class Unit {
     const oldValue = this._qid
     this._qid = value
     if (oldValue !== value && !this._isConstructing) {
+      invalidateJoinIdentity(this)
       if (oldValue !== undefined && oldValue !== null) {
         const _caller = new Error().stack?.split('\n').slice(1, 3).map((l: string) => l.trim()).join(' <- ')
         yasaWarning(`qid mutation after construction: "${oldValue}" → "${value}" (vtype=${this.vtype}) | ${_caller}`)
@@ -456,7 +458,11 @@ class Unit {
   }
 
   get parent(): Unit | null { return this._resolveValueRef(this._parentRef) }
-  set parent(unit: Unit | null) { this._parentRef = this._makeValueRef(unit) }
+  set parent(unit: Unit | null) {
+    const parentRef = this._makeValueRef(unit)
+    if (!this._isConstructing && this._parentRef?.uuid !== parentRef?.uuid) invalidateJoinIdentity(this)
+    this._parentRef = parentRef
+  }
 
   get packageScope(): Unit | null { return this._resolveValueRef(this._packageScopeRef) }
   set packageScope(unit: Unit | null) { this._packageScopeRef = this._makeValueRef(unit) }
